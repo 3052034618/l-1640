@@ -1,7 +1,8 @@
 import { useEffect, useState, useCallback, useMemo } from 'react'
-import { Search, FileDown, ChevronDown, Filter } from 'lucide-react'
-import type { OperationLog, PaginatedResult } from '@/types'
+import { Search, FileDown, ChevronDown, Filter, Download, History, RefreshCw } from 'lucide-react'
+import type { OperationLog, PaginatedResult, ExportTask } from '@/types'
 import { downloadFile } from '@/lib/helpers'
+import Modal from '@/components/Modal'
 
 const TYPE_OPTIONS = [
   { value: '', label: '全部' },
@@ -25,6 +26,10 @@ export default function LogList() {
   const [loading, setLoading] = useState(true)
   const [exporting, setExporting] = useState(false)
   const [exportMenuOpen, setExportMenuOpen] = useState(false)
+  const [exportModalOpen, setExportModalOpen] = useState(false)
+  const [exportTasks, setExportTasks] = useState<ExportTask[]>([])
+  const [exportTasksLoading, setExportTasksLoading] = useState(false)
+  const [reExportingId, setReExportingId] = useState<string | null>(null)
   const pageSize = 10
 
   const fetchData = useCallback(async () => {
@@ -45,7 +50,24 @@ export default function LogList() {
     finally { setLoading(false) }
   }, [page, employeeName, roomNumber, startDate, endDate, operationType])
 
+  const fetchExportTasks = useCallback(async () => {
+    setExportTasksLoading(true)
+    try {
+      const res = await fetch('/api/logs/export-tasks?pageSize=10')
+      if (!res.ok) throw new Error()
+      const data: PaginatedResult<ExportTask> = await res.json()
+      setExportTasks(data.list)
+    } catch { setExportTasks([]) }
+    finally { setExportTasksLoading(false) }
+  }, [])
+
   useEffect(() => { fetchData() }, [fetchData])
+
+  useEffect(() => {
+    if (exportModalOpen) {
+      fetchExportTasks()
+    }
+  }, [exportModalOpen, fetchExportTasks])
 
   const filterDisplayText = useMemo(() => {
     const parts: string[] = []
@@ -82,8 +104,29 @@ export default function LogList() {
     setExporting(true)
     try {
       await downloadFile(buildExportUrl(scope), `operation-logs-${scope === 'current' ? 'page' : 'all'}.xlsx`)
+      fetchExportTasks()
     } catch { alert('导出失败') }
     finally { setExporting(false) }
+  }
+
+  const handleReExport = async (task: ExportTask) => {
+    setReExportingId(task.id)
+    try {
+      const filters = task.filters || {}
+      const params = new URLSearchParams()
+      params.set('scope', task.scope)
+      params.set('page', String(filters.page || 1))
+      params.set('pageSize', String(filters.pageSize || 10))
+      params.set('filters', encodeURIComponent(JSON.stringify(filters)))
+      await downloadFile(`/api/logs/export?${params}`, task.fileName)
+    } catch { alert('重新导出失败') }
+    finally { setReExportingId(null) }
+  }
+
+  const formatFileSize = (bytes: number) => {
+    if (bytes < 1024) return bytes + ' B'
+    if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(2) + ' KB'
+    return (bytes / (1024 * 1024)).toFixed(2) + ' MB'
   }
 
   const totalPages = Math.ceil(total / pageSize)
@@ -102,32 +145,41 @@ export default function LogList() {
     <div className="p-6 space-y-4">
       <div className="flex items-center justify-between">
         <h1 className="text-xl font-bold text-gray-900">操作日志</h1>
-        <div className="relative">
+        <div className="flex items-center gap-3">
           <button
             className="btn-outline flex items-center gap-2 text-sm"
-            disabled={exporting}
-            onClick={() => setExportMenuOpen(o => !o)}
+            onClick={() => setExportModalOpen(true)}
           >
-            <FileDown className="w-4 h-4" />
-            {exporting ? '导出中...' : '导出Excel'}
-            <ChevronDown className="w-4 h-4" />
+            <History className="w-4 h-4" />
+            导出记录
           </button>
-          {exportMenuOpen && (
-            <div className="absolute right-0 top-full mt-1 w-44 bg-white border border-gray-200 rounded-lg shadow-lg z-10 overflow-hidden">
-              <button
-                className="w-full text-left px-4 py-2 text-sm text-gray-700 hover:bg-blue-50 hover:text-blue-600"
-                onClick={() => handleExport('current')}
-              >
-                导出当前页
-              </button>
-              <button
-                className="w-full text-left px-4 py-2 text-sm text-gray-700 hover:bg-blue-50 hover:text-blue-600"
-                onClick={() => handleExport('all')}
-              >
-                导出全部结果
-              </button>
-            </div>
-          )}
+          <div className="relative">
+            <button
+              className="btn-outline flex items-center gap-2 text-sm"
+              disabled={exporting}
+              onClick={() => setExportMenuOpen(o => !o)}
+            >
+              <FileDown className="w-4 h-4" />
+              {exporting ? '导出中...' : '导出Excel'}
+              <ChevronDown className="w-4 h-4" />
+            </button>
+            {exportMenuOpen && (
+              <div className="absolute right-0 top-full mt-1 w-44 bg-white border border-gray-200 rounded-lg shadow-lg z-10 overflow-hidden">
+                <button
+                  className="w-full text-left px-4 py-2 text-sm text-gray-700 hover:bg-blue-50 hover:text-blue-600"
+                  onClick={() => handleExport('current')}
+                >
+                  导出当前页
+                </button>
+                <button
+                  className="w-full text-left px-4 py-2 text-sm text-gray-700 hover:bg-blue-50 hover:text-blue-600"
+                  onClick={() => handleExport('all')}
+                >
+                  导出全部结果
+                </button>
+              </div>
+            )}
+          </div>
         </div>
       </div>
 
@@ -190,6 +242,93 @@ export default function LogList() {
           <button className="btn-outline text-sm" disabled={page >= totalPages} onClick={() => setPage(p => p + 1)}>下一页</button>
         </div>
       )}
+
+      <Modal
+        open={exportModalOpen}
+        onClose={() => setExportModalOpen(false)}
+        title="导出记录"
+        width="max-w-4xl"
+      >
+        <div className="space-y-4">
+          {exportTasksLoading ? (
+            <div className="space-y-2">
+              {Array.from({ length: 3 }).map((_, i) => (
+                <div key={i} className="h-16 bg-gray-100 rounded animate-pulse" />
+              ))}
+            </div>
+          ) : exportTasks.length === 0 ? (
+            <div className="text-center py-12 text-gray-400">
+              <History className="w-12 h-12 mx-auto mb-3 opacity-50" />
+              <p>暂无导出记录</p>
+            </div>
+          ) : (
+            <div className="overflow-x-auto">
+              <table className="w-full">
+                <thead>
+                  <tr className="border-b border-gray-200">
+                    <th className="px-3 py-2 text-left text-sm font-medium text-gray-600">导出时间</th>
+                    <th className="px-3 py-2 text-left text-sm font-medium text-gray-600">文件名</th>
+                    <th className="px-3 py-2 text-left text-sm font-medium text-gray-600">范围</th>
+                    <th className="px-3 py-2 text-left text-sm font-medium text-gray-600">筛选条件</th>
+                    <th className="px-3 py-2 text-left text-sm font-medium text-gray-600">记录数</th>
+                    <th className="px-3 py-2 text-left text-sm font-medium text-gray-600">文件大小</th>
+                    <th className="px-3 py-2 text-right text-sm font-medium text-gray-600">操作</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {exportTasks.map(task => (
+                    <tr key={task.id} className="border-b border-gray-100 hover:bg-gray-50">
+                      <td className="px-3 py-3 text-sm text-gray-600">
+                        {new Date(task.createdAt).toLocaleString('zh-CN')}
+                      </td>
+                      <td className="px-3 py-3 text-sm text-gray-900 font-medium max-w-[180px] truncate" title={task.fileName}>
+                        {task.fileName}
+                      </td>
+                      <td className="px-3 py-3 text-sm">
+                        <span className={`inline-flex px-2 py-0.5 rounded text-xs font-medium ${task.scope === 'all' ? 'bg-blue-100 text-blue-700' : 'bg-green-100 text-green-700'}`}>
+                          {task.scope === 'all' ? '全部' : '当前页'}
+                        </span>
+                      </td>
+                      <td className="px-3 py-3 text-sm text-gray-600 max-w-[200px] truncate" title={task.filterDescription}>
+                        {task.filterDescription}
+                      </td>
+                      <td className="px-3 py-3 text-sm text-gray-600">
+                        {task.recordCount} 条
+                      </td>
+                      <td className="px-3 py-3 text-sm text-gray-600">
+                        {formatFileSize(task.fileSize)}
+                      </td>
+                      <td className="px-3 py-3 text-right">
+                        <div className="flex items-center justify-end gap-2">
+                          <button
+                            className="text-sm text-blue-600 hover:text-blue-800 flex items-center gap-1 disabled:opacity-50"
+                            onClick={() => handleReExport(task)}
+                            disabled={reExportingId === task.id}
+                          >
+                            <Download className="w-3.5 h-3.5" />
+                            {reExportingId === task.id ? '下载中...' : '下载'}
+                          </button>
+                          <button
+                            className="text-sm text-gray-600 hover:text-gray-800 flex items-center gap-1 disabled:opacity-50"
+                            onClick={() => handleReExport(task)}
+                            disabled={reExportingId === task.id}
+                          >
+                            <RefreshCw className="w-3.5 h-3.5" />
+                            重新导出
+                          </button>
+                        </div>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+          <div className="pt-2 text-xs text-gray-400 text-center">
+            显示最近 10 条导出记录，记录保留 7 天
+          </div>
+        </div>
+      </Modal>
     </div>
   )
 }

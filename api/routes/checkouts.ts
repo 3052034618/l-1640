@@ -187,6 +187,103 @@ router.put('/:id/checklist', (req: Request, res: Response) => {
   res.json(checkout);
 });
 
+function validateAndCalculate(checkoutId: string, waterReading: number, electricReading: number, facilityDamages: DamageItem[], depositDeducted: number) {
+  const checkout = db.checkouts.find(c => c.id === checkoutId);
+  if (!checkout) {
+    return { error: 'Checkout not found', status: 404 };
+  }
+
+  const errors: { errorType: string; message: string; details?: any }[] = [];
+  const warnings: string[] = [];
+
+  const checklistItems = db.checklistItems.filter(ci => ci.checkoutId === checkoutId);
+  const pendingItems = checklistItems.filter(ci => ci.status === 'pending');
+  if (pendingItems.length > 0) {
+    const names = pendingItems.map(i => i.itemName);
+    errors.push({ errorType: 'checklist_incomplete', message: '尚有未处理检查项', details: names });
+  }
+
+  if (waterReading < checkout.previousWaterReading) {
+    errors.push({ errorType: 'water_reading_low', message: '水表读数小于上次读数' });
+  }
+
+  if (electricReading < checkout.previousElectricReading) {
+    errors.push({ errorType: 'electric_reading_low', message: '电表读数小于上次读数' });
+  }
+
+  const negativeDamages = facilityDamages.filter(d => d.amount < 0);
+  if (negativeDamages.length > 0) {
+    errors.push({ errorType: 'negative_damage', message: '存在负数赔偿金额', details: negativeDamages.map(d => d.name) });
+  }
+
+  if (depositDeducted < 0 || depositDeducted > checkout.deposit) {
+    errors.push({ errorType: 'invalid_deposit_deduction', message: '押金抵扣金额无效' });
+  }
+
+  const waterFee = Math.round(Math.max(0, waterReading - checkout.previousWaterReading) * 5 * 100) / 100;
+  const electricFee = Math.round(Math.max(0, electricReading - checkout.previousElectricReading) * 0.8 * 100) / 100;
+  const damagesTotal = Math.round(facilityDamages.reduce((sum, d) => sum + d.amount, 0) * 100) / 100;
+  const totalFee = Math.round((waterFee + electricFee + damagesTotal) * 100) / 100;
+  const finalFee = Math.round((totalFee - depositDeducted) * 100) / 100;
+
+  if (finalFee < 0) {
+    errors.push({ errorType: 'negative_fee', message: '最终费用为负，请核对' });
+  }
+
+  const largeDamages = facilityDamages.filter(d => d.amount > 2000);
+  if (largeDamages.length > 0) {
+    warnings.push(`存在单笔赔偿金额超过2000元：${largeDamages.map(d => d.name).join('、')}`);
+  }
+
+  if (totalFee > 5000) {
+    warnings.push(`总费用(${totalFee.toFixed(2)}元)超过5000元，请确认`);
+  }
+
+  const calculationBreakdown = {
+    water: {
+      previousReading: checkout.previousWaterReading,
+      currentReading: waterReading,
+      usage: Math.max(0, waterReading - checkout.previousWaterReading),
+      unitPrice: 5,
+      fee: waterFee,
+    },
+    electric: {
+      previousReading: checkout.previousElectricReading,
+      currentReading: electricReading,
+      usage: Math.max(0, electricReading - checkout.previousElectricReading),
+      unitPrice: 0.8,
+      fee: electricFee,
+    },
+    damages: facilityDamages.map(d => ({
+      id: d.id,
+      name: d.name,
+      amount: d.amount,
+      remark: d.remark,
+    })),
+    damagesTotal,
+    deposit: {
+      original: checkout.deposit,
+      deducted: depositDeducted,
+      remaining: checkout.deposit - depositDeducted,
+    },
+    totalFee,
+    finalFee,
+  };
+
+  return {
+    errors,
+    warnings,
+    waterFee,
+    electricFee,
+    damagesTotal,
+    totalFee,
+    depositDeducted,
+    finalFee,
+    calculationBreakdown,
+    checkout,
+  };
+}
+
 router.put('/:id/settle', (req: Request, res: Response) => {
   const checkout = db.checkouts.find(c => c.id === req.params.id);
   if (!checkout) {
@@ -194,35 +291,79 @@ router.put('/:id/settle', (req: Request, res: Response) => {
     return;
   }
 
-  const { waterReading, electricReading, facilityDamages } = req.body as {
+  const { waterReading, electricReading, facilityDamages, depositDeducted } = req.body as {
     waterReading: number;
     electricReading: number;
     facilityDamages?: DamageItem[];
+    depositDeducted?: number;
   };
 
-  if (waterReading < checkout.previousWaterReading || electricReading < checkout.previousElectricReading) {
-    res.status(400).json({ error: '读数小于上次读数' });
+  const damages = facilityDamages || checkout.facilityDamages || [];
+  const depDed = depositDeducted !== undefined ? depositDeducted : checkout.depositDeducted;
+
+  const result = validateAndCalculate(req.params.id, waterReading, electricReading, damages, depDed);
+
+  if ('status' in result && result.status === 404) {
+    res.status(404).json({ error: result.error });
     return;
   }
 
-  const updatedItems = db.checklistItems.filter(ci => ci.checkoutId === req.params.id);
-  const pendingItems = updatedItems.filter(ci => ci.status === 'pending');
-  if (pendingItems.length > 0) {
-    const names = pendingItems.map(i => i.itemName).join('、');
-    res.status(400).json({ error: `尚有未处理检查项：${names}` });
+  if (result.errors && result.errors.length > 0) {
+    const firstError = result.errors[0];
+    res.status(400).json({
+      error: firstError.message,
+      errorType: firstError.errorType,
+      details: firstError.details,
+      errors: result.errors,
+    });
     return;
   }
+
+  res.json({
+    waterFee: result.waterFee,
+    electricFee: result.electricFee,
+    damagesTotal: result.damagesTotal,
+    totalFee: result.totalFee,
+    depositDeducted: result.depositDeducted,
+    finalFee: result.finalFee,
+    calculationBreakdown: result.calculationBreakdown,
+    warnings: result.warnings,
+    status: checkout.status,
+  });
+});
+
+router.put('/:id/generate-invoice', (req: Request, res: Response) => {
+  const checkout = db.checkouts.find(c => c.id === req.params.id);
+  if (!checkout) {
+    res.status(404).json({ error: 'Checkout not found' });
+    return;
+  }
+
+  const { waterReading, electricReading, facilityDamages, depositDeducted } = req.body as {
+    waterReading: number;
+    electricReading: number;
+    facilityDamages?: DamageItem[];
+    depositDeducted?: number;
+  };
 
   const damages = facilityDamages || checkout.facilityDamages || [];
-  const waterFee = Math.round((waterReading - checkout.previousWaterReading) * 5 * 100) / 100;
-  const electricFee = Math.round((electricReading - checkout.previousElectricReading) * 0.8 * 100) / 100;
-  const damagesTotal = Math.round(damages.reduce((sum, d) => sum + d.amount, 0) * 100) / 100;
-  const totalFee = Math.round((waterFee + electricFee + damagesTotal) * 100) / 100;
-  const depositDeducted = Math.round(Math.min(totalFee, checkout.deposit) * 100) / 100;
-  const finalFee = Math.round((totalFee - depositDeducted) * 100) / 100;
+  const depDed = depositDeducted !== undefined ? depositDeducted : checkout.depositDeducted;
 
-  if (finalFee < 0) {
-    res.status(400).json({ error: '费用异常，请核对' });
+  const result = validateAndCalculate(req.params.id, waterReading, electricReading, damages, depDed);
+
+  if ('status' in result && result.status === 404) {
+    res.status(404).json({ error: result.error });
+    return;
+  }
+
+  if (result.errors && result.errors.length > 0) {
+    const firstError = result.errors[0];
+    res.status(400).json({
+      error: firstError.message,
+      errorType: firstError.errorType,
+      details: firstError.details,
+      errors: result.errors,
+    });
     return;
   }
 
@@ -230,16 +371,16 @@ router.put('/:id/settle', (req: Request, res: Response) => {
   const bed = app?.bedId ? db.beds.find(b => b.id === app.bedId) : null;
   const room = bed ? db.rooms.find(r => r.id === bed.roomId) : null;
   const capacity = room?.capacity || 1;
-  const sharePerPerson = Math.round(finalFee / capacity * 100) / 100;
+  const sharePerPerson = Math.round((result.finalFee || 0) / capacity * 100) / 100;
 
   checkout.waterReading = waterReading;
   checkout.electricReading = electricReading;
-  checkout.waterFee = waterFee;
-  checkout.electricFee = electricFee;
+  checkout.waterFee = result.waterFee || 0;
+  checkout.electricFee = result.electricFee || 0;
   checkout.facilityDamages = damages;
-  checkout.depositDeducted = depositDeducted;
-  checkout.totalFee = totalFee;
-  checkout.finalFee = finalFee;
+  checkout.depositDeducted = result.depositDeducted || 0;
+  checkout.totalFee = result.totalFee || 0;
+  checkout.finalFee = result.finalFee || 0;
   checkout.sharePerPerson = sharePerPerson;
   checkout.status = 'completed';
   checkout.completedAt = new Date().toISOString();
@@ -265,7 +406,7 @@ router.put('/:id/settle', (req: Request, res: Response) => {
     employeeName: emp?.name || '',
     operationType: 'checkout',
     roomNumber: roomForLog?.roomNumber || '',
-    description: `${emp?.name || ''}退房结算完成: 水费${waterFee}元, 电费${electricFee}元, 赔偿${damagesTotal}元, 押金抵扣${depositDeducted}元, 实付${finalFee}元, 已释放床位`,
+    description: `${emp?.name || ''}退房结算完成: 水费${result.waterFee}元, 电费${result.electricFee}元, 赔偿${result.damagesTotal}元, 押金抵扣${result.depositDeducted}元, 实付${result.finalFee}元, 已释放床位`,
     createdAt: new Date().toISOString(),
   });
 

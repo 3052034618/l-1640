@@ -31,6 +31,49 @@ interface MatchedBed {
 
 type RuleTab = 'priority' | 'preference' | 'forbidden'
 
+const RULE_STATUS_MAP: Record<string, { text: string; className: string }> = {
+  active: { text: '生效中', className: 'bg-emerald-100 text-emerald-800' },
+  inactive: { text: '未启用', className: 'bg-gray-100 text-gray-600' },
+  expired: { text: '已过期', className: 'bg-orange-100 text-orange-700' },
+  upcoming: { text: '待生效', className: 'bg-blue-100 text-blue-700' },
+}
+
+function getRuleStatus(rule: { enabled: boolean; startDate: string | null; endDate: string | null }): 'active' | 'inactive' | 'expired' | 'upcoming' {
+  const nowStr = new Date().toISOString().split('T')[0]
+  if (!rule.enabled) return 'inactive'
+  if (rule.startDate && rule.startDate > nowStr) return 'upcoming'
+  if (rule.endDate && rule.endDate < nowStr) return 'expired'
+  return 'active'
+}
+
+const ERROR_CONFIG: Record<string, { icon: string; title: string; bgColor: string; borderColor: string; textColor: string; iconColor: string }> = {
+  bed_not_found: { icon: '🔴', title: '床位不存在', bgColor: 'bg-red-50', borderColor: 'border-red-200', textColor: 'text-red-700', iconColor: 'text-red-500' },
+  bed_occupied: { icon: '🟠', title: '床位已被占用', bgColor: 'bg-orange-50', borderColor: 'border-orange-200', textColor: 'text-orange-700', iconColor: 'text-orange-500' },
+  type_mismatch: { icon: '🟡', title: '房型不匹配', bgColor: 'bg-yellow-50', borderColor: 'border-yellow-200', textColor: 'text-yellow-700', iconColor: 'text-yellow-500' },
+  gender_mismatch: { icon: '🔵', title: '性别不匹配', bgColor: 'bg-blue-50', borderColor: 'border-blue-200', textColor: 'text-blue-700', iconColor: 'text-blue-500' },
+  duplicate_checkin: { icon: '🟣', title: '重复入住', bgColor: 'bg-purple-50', borderColor: 'border-purple-200', textColor: 'text-purple-700', iconColor: 'text-purple-500' },
+  forbidden_violation: { icon: '⚫', title: '禁住规则', bgColor: 'bg-gray-50', borderColor: 'border-gray-300', textColor: 'text-gray-700', iconColor: 'text-gray-600' },
+}
+
+function getErrorMessage(errorType: string, details: any): string {
+  switch (errorType) {
+    case 'bed_not_found':
+      return '所选床位已被删除，请刷新候选列表'
+    case 'bed_occupied':
+      return '该床位刚刚被其他申请占用，请重新选择'
+    case 'type_mismatch':
+      return `申请的是${details?.applied || ''}，但该床位属于${details?.actual || ''}`
+    case 'gender_mismatch':
+      return `该床位属于${details?.buildingName || ''}（${details?.buildingGender || ''}生楼）`
+    case 'duplicate_checkin':
+      return `该员工已入住${details?.currentRoom || ''}（${details?.startDate || ''}起）`
+    case 'forbidden_violation':
+      return `${details?.department || ''}禁止入住${details?.buildingName || ''}（${details?.reason || ''}）`
+    default:
+      return '审批失败，请重试'
+  }
+}
+
 export default function CheckinDetail() {
   const { id } = useParams<{ id: string }>()
   const navigate = useNavigate()
@@ -50,8 +93,12 @@ export default function CheckinDetail() {
   const [autoAssignReason, setAutoAssignReason] = useState('')
   const [showConfirmModal, setShowConfirmModal] = useState(false)
   const [conflictError, setConflictError] = useState('')
+  const [conflictErrorType, setConflictErrorType] = useState('')
+  const [conflictErrorDetails, setConflictErrorDetails] = useState<any>(null)
   const [autoAssigning, setAutoAssigning] = useState(false)
+  const [refreshingBeds, setRefreshingBeds] = useState(false)
   const [refreshBedsKey, setRefreshBedsKey] = useState(0)
+  const [effectiveCounts, setEffectiveCounts] = useState({ departmentPriorities: 0, buildingPreferences: 0, forbiddenRules: 0 })
 
   const loadApplicationAndBeds = () => {
     setLoading(true)
@@ -65,16 +112,33 @@ export default function CheckinDetail() {
     }).catch(() => {}).finally(() => setLoading(false))
   }
 
+  const loadMatchedBeds = () => {
+    if (!id) return
+    setRefreshingBeds(true)
+    fetch(`/api/applications/${id}/match-beds`)
+      .then(r => r.json())
+      .then((data: MatchBedsResult) => {
+        setBeds(data.beds || [])
+        setForbiddenBuildings(data.forbiddenBuildings || [])
+      })
+      .catch(() => {})
+      .finally(() => setRefreshingBeds(false))
+  }
+
   useEffect(() => {
     loadApplicationAndBeds()
+    loadRules()
   }, [id, refreshBedsKey])
 
   const loadRules = async () => {
     try {
       const res = await fetch('/api/applications/rules')
       if (res.ok) {
-        const data = await res.json() as AssignmentRuleData
+        const data = await res.json() as any
         setRulesData(data)
+        if (data.effectiveCounts) {
+          setEffectiveCounts(data.effectiveCounts)
+        }
       }
     } catch {}
   }
@@ -117,12 +181,12 @@ export default function CheckinDetail() {
       ...rulesData,
       departmentPriorities: [
         ...rulesData.departmentPriorities,
-        { id: uuidv4(), department: rulesData.departments[0] || '', priority: 5 },
+        { id: uuidv4(), department: rulesData.departments[0] || '', priority: 5, enabled: true, startDate: null, endDate: null },
       ],
     })
   }
 
-  const updateDeptPriority = (idx: number, field: 'department' | 'priority', value: string | number) => {
+  const updateDeptPriority = (idx: number, field: string, value: string | number | boolean | null) => {
     if (!rulesData) return
     const updated = [...rulesData.departmentPriorities]
     updated[idx] = { ...updated[idx], [field]: value } as DepartmentPriority
@@ -141,12 +205,12 @@ export default function CheckinDetail() {
       ...rulesData,
       buildingPreferences: [
         ...rulesData.buildingPreferences,
-        { id: uuidv4(), department: rulesData.departments[0] || '', buildingId: rulesData.buildings[0]?.id || '', priority: 5 },
+        { id: uuidv4(), department: rulesData.departments[0] || '', buildingId: rulesData.buildings[0]?.id || '', priority: 5, enabled: true, startDate: null, endDate: null },
       ],
     })
   }
 
-  const updateBuildingPref = (idx: number, field: string, value: string | number) => {
+  const updateBuildingPref = (idx: number, field: string, value: string | number | boolean | null) => {
     if (!rulesData) return
     const updated = [...rulesData.buildingPreferences]
     updated[idx] = { ...updated[idx], [field]: value } as BuildingPreference
@@ -165,12 +229,12 @@ export default function CheckinDetail() {
       ...rulesData,
       forbiddenRules: [
         ...rulesData.forbiddenRules,
-        { id: uuidv4(), department: rulesData.departments[0] || '', buildingId: rulesData.buildings[0]?.id || '', reason: '' },
+        { id: uuidv4(), department: rulesData.departments[0] || '', buildingId: rulesData.buildings[0]?.id || '', reason: '', enabled: true, startDate: null, endDate: null },
       ],
     })
   }
 
-  const updateForbiddenRule = (idx: number, field: string, value: string) => {
+  const updateForbiddenRule = (idx: number, field: string, value: string | boolean | null) => {
     if (!rulesData) return
     const updated = [...rulesData.forbiddenRules]
     updated[idx] = { ...updated[idx], [field]: value } as ForbiddenRule
@@ -187,6 +251,8 @@ export default function CheckinDetail() {
     if (!id) return
     setAutoAssigning(true)
     setConflictError('')
+    setConflictErrorType('')
+    setConflictErrorDetails(null)
     try {
       const res = await fetch(`/api/applications/${id}/auto-assign`, {
         method: 'PUT',
@@ -213,6 +279,8 @@ export default function CheckinDetail() {
       return
     }
     setConflictError('')
+    setConflictErrorType('')
+    setConflictErrorDetails(null)
     setShowConfirmModal(true)
   }
 
@@ -225,19 +293,24 @@ export default function CheckinDetail() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ bedId: selectedBed, assignReason: autoAssignReason }),
       })
-      if (res.status === 409) {
+      if (res.status === 409 || res.status === 404) {
         const err = await res.json().catch(() => ({}))
-        setConflictError(err.reason || '床位分配冲突')
-        setRefreshBedsKey(k => k + 1)
+        setConflictError(err.error || '审批失败')
+        setConflictErrorType(err.errorType || '')
+        setConflictErrorDetails(err.details || null)
         setSelectedBed('')
         setAutoAssignReason('')
         setShowConfirmModal(false)
+        loadMatchedBeds()
         return
       }
       if (!res.ok) throw new Error()
       const updated = await res.json() as Application
       setApp(updated)
       setShowConfirmModal(false)
+      setConflictError('')
+      setConflictErrorType('')
+      setConflictErrorDetails(null)
     } catch {
       alert('操作失败')
     } finally {
@@ -333,7 +406,7 @@ export default function CheckinDetail() {
 
       {app.status === 'pending' && (
         <div className="card p-6">
-          <div className="flex items-center justify-between mb-4">
+          <div className="flex items-center justify-between mb-2">
             <h3 className="text-lg font-bold text-gray-900">推荐床位</h3>
             <div className="flex items-center gap-3">
               <button
@@ -350,6 +423,9 @@ export default function CheckinDetail() {
               </div>
             </div>
           </div>
+          <div className="text-xs text-gray-500 mb-4 pb-2 border-b border-gray-100">
+            当前使用 {effectiveCounts.departmentPriorities + effectiveCounts.buildingPreferences + effectiveCounts.forbiddenRules} 条有效规则（部门优先级 {effectiveCounts.departmentPriorities} 条、楼栋偏好 {effectiveCounts.buildingPreferences} 条、禁住 {effectiveCounts.forbiddenRules} 条）
+          </div>
 
           {forbiddenBuildings.length > 0 && (
             <div className="mb-4 p-3 bg-amber-50 border border-amber-200 rounded-lg flex items-start gap-2">
@@ -363,13 +439,10 @@ export default function CheckinDetail() {
             </div>
           )}
 
-          {conflictError && (
-            <div className="mb-4 p-3 bg-red-50 border border-red-200 rounded-lg flex items-start gap-2">
-              <AlertTriangle className="w-4 h-4 text-red-500 mt-0.5 flex-shrink-0" />
-              <div className="text-xs text-red-700">
-                <div className="font-medium mb-1">审批冲突：</div>
-                <div>{conflictError}（候选床位已刷新，请重新选择）</div>
-              </div>
+          {refreshingBeds && (
+            <div className="mb-4 p-3 bg-blue-50 border border-blue-200 rounded-lg flex items-center gap-2">
+              <div className="w-4 h-4 border-2 border-blue-500 border-t-transparent rounded-full animate-spin" />
+              <span className="text-xs text-blue-700">正在刷新候选床位...</span>
             </div>
           )}
 
@@ -411,12 +484,16 @@ export default function CheckinDetail() {
                       setSelectedBed(bed.id)
                       setAutoAssignReason('')
                       setConflictError('')
+                      setConflictErrorType('')
+                      setConflictErrorDetails(null)
                     }}>
                     <div className="flex items-center gap-3">
                       <input type="radio" name="bed" checked={selectedBed === bed.id} onChange={() => {
                         setSelectedBed(bed.id)
                         setAutoAssignReason('')
                         setConflictError('')
+                        setConflictErrorType('')
+                        setConflictErrorDetails(null)
                       }} className="accent-[#1E3A5F]" />
                       <span className="font-medium text-sm">{bed.buildingName} {bed.roomNumber} - {bed.bedNumber}号床</span>
                       <span className={`px-2 py-0.5 rounded-full text-xs font-medium ${pl.color}`}>{pl.text}</span>
@@ -453,6 +530,31 @@ export default function CheckinDetail() {
               <X className="w-4 h-4" /> 拒绝
             </button>
           </div>
+
+          {conflictError && conflictErrorType && (() => {
+            const config = ERROR_CONFIG[conflictErrorType] || ERROR_CONFIG.bed_not_found
+            const message = getErrorMessage(conflictErrorType, conflictErrorDetails)
+            return (
+              <div className={`mt-3 p-3 ${config.bgColor} border ${config.borderColor} rounded-lg flex items-start gap-2`}>
+                <span className="text-base flex-shrink-0 leading-5">{config.icon}</span>
+                <div className={`text-xs ${config.textColor}`}>
+                  <div className="font-medium mb-1">{config.title}：</div>
+                  <div>{message}</div>
+                  <div className="mt-1 opacity-75">（候选床位已刷新，请重新选择）</div>
+                </div>
+              </div>
+            )
+          })()}
+
+          {conflictError && !conflictErrorType && (
+            <div className="mt-3 p-3 bg-red-50 border border-red-200 rounded-lg flex items-start gap-2">
+              <AlertTriangle className="w-4 h-4 text-red-500 mt-0.5 flex-shrink-0" />
+              <div className="text-xs text-red-700">
+                <div className="font-medium mb-1">审批冲突：</div>
+                <div>{conflictError}（候选床位已刷新，请重新选择）</div>
+              </div>
+            </div>
+          )}
         </div>
       )}
 
@@ -535,33 +637,73 @@ export default function CheckinDetail() {
                   {rulesData.departmentPriorities.length === 0 ? (
                     <p className="text-sm text-gray-400 py-6 text-center">暂无部门优先级配置</p>
                   ) : (
-                    rulesData.departmentPriorities.map((dp, idx) => (
-                      <div key={dp.id} className="flex items-center gap-2 p-2 border border-gray-200 rounded-lg">
-                        <select
-                          className="input-field text-sm py-1.5 flex-1"
-                          value={dp.department}
-                          onChange={e => updateDeptPriority(idx, 'department', e.target.value)}
-                        >
-                          {rulesData.departments.map(d => (
-                            <option key={d} value={d}>{d}</option>
-                          ))}
-                        </select>
-                        <div className="flex items-center gap-2">
-                          <span className="text-xs text-gray-500">优先级:</span>
-                          <input
-                            type="number"
-                            min={1}
-                            max={10}
-                            className="input-field text-sm py-1.5 w-20 text-center"
-                            value={dp.priority}
-                            onChange={e => updateDeptPriority(idx, 'priority', Math.max(1, Math.min(10, Number(e.target.value) || 1)))}
-                          />
+                    rulesData.departmentPriorities.map((dp, idx) => {
+                      const status = getRuleStatus(dp)
+                      const statusInfo = RULE_STATUS_MAP[status]
+                      return (
+                        <div key={dp.id} className={`p-3 border rounded-lg ${dp.enabled ? 'border-gray-200' : 'border-gray-100 bg-gray-50 opacity-70'}`}>
+                          <div className="flex items-center gap-2 mb-2">
+                            <input
+                              type="checkbox"
+                              checked={dp.enabled}
+                              onChange={e => updateDeptPriority(idx, 'enabled', e.target.checked)}
+                              className="w-4 h-4 accent-[#1E3A5F] cursor-pointer"
+                            />
+                            <span className={`px-2 py-0.5 rounded-full text-xs font-medium ${statusInfo.className}`}>
+                              {statusInfo.text}
+                            </span>
+                            <button className="p-1 text-red-400 hover:text-red-600 hover:bg-red-50 rounded ml-auto" onClick={() => removeDeptPriority(idx)}>
+                              <Trash2 className="w-4 h-4" />
+                            </button>
+                          </div>
+                          <div className="flex items-center gap-2 ml-6">
+                            <select
+                              className="input-field text-sm py-1.5 flex-1"
+                              value={dp.department}
+                              onChange={e => updateDeptPriority(idx, 'department', e.target.value)}
+                              disabled={!dp.enabled}
+                            >
+                              {rulesData.departments.map(d => (
+                                <option key={d} value={d}>{d}</option>
+                              ))}
+                            </select>
+                            <div className="flex items-center gap-2">
+                              <span className="text-xs text-gray-500">优先级:</span>
+                              <input
+                                type="number"
+                                min={1}
+                                max={10}
+                                className="input-field text-sm py-1.5 w-20 text-center"
+                                value={dp.priority}
+                                onChange={e => updateDeptPriority(idx, 'priority', Math.max(1, Math.min(10, Number(e.target.value) || 1)))}
+                                disabled={!dp.enabled}
+                              />
+                            </div>
+                          </div>
+                          <div className="flex items-center gap-2 mt-2 ml-6">
+                            <span className="text-xs text-gray-500 w-16">生效时间:</span>
+                            <input
+                              type="date"
+                              className="input-field text-sm py-1.5 flex-1"
+                              value={dp.startDate || ''}
+                              onChange={e => updateDeptPriority(idx, 'startDate', e.target.value || null)}
+                              disabled={!dp.enabled}
+                            />
+                            <span className="text-xs text-gray-400">至</span>
+                            <input
+                              type="date"
+                              className="input-field text-sm py-1.5 flex-1"
+                              value={dp.endDate || ''}
+                              onChange={e => updateDeptPriority(idx, 'endDate', e.target.value || null)}
+                              disabled={!dp.enabled}
+                            />
+                          </div>
+                          <div className="text-xs text-gray-400 mt-1 ml-6">
+                            留空表示永久生效
+                          </div>
                         </div>
-                        <button className="p-1.5 text-red-400 hover:text-red-600 hover:bg-red-50 rounded" onClick={() => removeDeptPriority(idx)}>
-                          <Trash2 className="w-4 h-4" />
-                        </button>
-                      </div>
-                    ))
+                      )
+                    })
                   )}
                 </div>
               </div>
@@ -579,43 +721,84 @@ export default function CheckinDetail() {
                   {rulesData.buildingPreferences.length === 0 ? (
                     <p className="text-sm text-gray-400 py-6 text-center">暂无楼栋偏好配置</p>
                   ) : (
-                    rulesData.buildingPreferences.map((bp, idx) => (
-                      <div key={bp.id} className="flex items-center gap-2 p-2 border border-gray-200 rounded-lg">
-                        <select
-                          className="input-field text-sm py-1.5 flex-1"
-                          value={bp.department}
-                          onChange={e => updateBuildingPref(idx, 'department', e.target.value)}
-                        >
-                          {rulesData.departments.map(d => (
-                            <option key={d} value={d}>{d}</option>
-                          ))}
-                        </select>
-                        <span className="text-xs text-gray-400">→</span>
-                        <select
-                          className="input-field text-sm py-1.5 flex-1"
-                          value={bp.buildingId}
-                          onChange={e => updateBuildingPref(idx, 'buildingId', e.target.value)}
-                        >
-                          {rulesData.buildings.map(b => (
-                            <option key={b.id} value={b.id}>{b.name}</option>
-                          ))}
-                        </select>
-                        <div className="flex items-center gap-2">
-                          <span className="text-xs text-gray-500">权重:</span>
-                          <input
-                            type="number"
-                            min={1}
-                            max={10}
-                            className="input-field text-sm py-1.5 w-20 text-center"
-                            value={bp.priority}
-                            onChange={e => updateBuildingPref(idx, 'priority', Math.max(1, Math.min(10, Number(e.target.value) || 1)))}
-                          />
+                    rulesData.buildingPreferences.map((bp, idx) => {
+                      const status = getRuleStatus(bp)
+                      const statusInfo = RULE_STATUS_MAP[status]
+                      return (
+                        <div key={bp.id} className={`p-3 border rounded-lg ${bp.enabled ? 'border-gray-200' : 'border-gray-100 bg-gray-50 opacity-70'}`}>
+                          <div className="flex items-center gap-2 mb-2">
+                            <input
+                              type="checkbox"
+                              checked={bp.enabled}
+                              onChange={e => updateBuildingPref(idx, 'enabled', e.target.checked)}
+                              className="w-4 h-4 accent-[#1E3A5F] cursor-pointer"
+                            />
+                            <span className={`px-2 py-0.5 rounded-full text-xs font-medium ${statusInfo.className}`}>
+                              {statusInfo.text}
+                            </span>
+                            <button className="p-1 text-red-400 hover:text-red-600 hover:bg-red-50 rounded ml-auto" onClick={() => removeBuildingPref(idx)}>
+                              <Trash2 className="w-4 h-4" />
+                            </button>
+                          </div>
+                          <div className="flex items-center gap-2 ml-6">
+                            <select
+                              className="input-field text-sm py-1.5 flex-1"
+                              value={bp.department}
+                              onChange={e => updateBuildingPref(idx, 'department', e.target.value)}
+                              disabled={!bp.enabled}
+                            >
+                              {rulesData.departments.map(d => (
+                                <option key={d} value={d}>{d}</option>
+                              ))}
+                            </select>
+                            <span className="text-xs text-gray-400">→</span>
+                            <select
+                              className="input-field text-sm py-1.5 flex-1"
+                              value={bp.buildingId}
+                              onChange={e => updateBuildingPref(idx, 'buildingId', e.target.value)}
+                              disabled={!bp.enabled}
+                            >
+                              {rulesData.buildings.map(b => (
+                                <option key={b.id} value={b.id}>{b.name}</option>
+                              ))}
+                            </select>
+                            <div className="flex items-center gap-2">
+                              <span className="text-xs text-gray-500">权重:</span>
+                              <input
+                                type="number"
+                                min={1}
+                                max={10}
+                                className="input-field text-sm py-1.5 w-20 text-center"
+                                value={bp.priority}
+                                onChange={e => updateBuildingPref(idx, 'priority', Math.max(1, Math.min(10, Number(e.target.value) || 1)))}
+                                disabled={!bp.enabled}
+                              />
+                            </div>
+                          </div>
+                          <div className="flex items-center gap-2 mt-2 ml-6">
+                            <span className="text-xs text-gray-500 w-16">生效时间:</span>
+                            <input
+                              type="date"
+                              className="input-field text-sm py-1.5 flex-1"
+                              value={bp.startDate || ''}
+                              onChange={e => updateBuildingPref(idx, 'startDate', e.target.value || null)}
+                              disabled={!bp.enabled}
+                            />
+                            <span className="text-xs text-gray-400">至</span>
+                            <input
+                              type="date"
+                              className="input-field text-sm py-1.5 flex-1"
+                              value={bp.endDate || ''}
+                              onChange={e => updateBuildingPref(idx, 'endDate', e.target.value || null)}
+                              disabled={!bp.enabled}
+                            />
+                          </div>
+                          <div className="text-xs text-gray-400 mt-1 ml-6">
+                            留空表示永久生效
+                          </div>
                         </div>
-                        <button className="p-1.5 text-red-400 hover:text-red-600 hover:bg-red-50 rounded" onClick={() => removeBuildingPref(idx)}>
-                          <Trash2 className="w-4 h-4" />
-                        </button>
-                      </div>
-                    ))
+                      )
+                    })
                   )}
                 </div>
               </div>
@@ -633,40 +816,79 @@ export default function CheckinDetail() {
                   {rulesData.forbiddenRules.length === 0 ? (
                     <p className="text-sm text-gray-400 py-6 text-center">暂无禁住规则</p>
                   ) : (
-                    rulesData.forbiddenRules.map((fr, idx) => (
-                      <div key={fr.id} className="p-2 border border-gray-200 rounded-lg space-y-2">
-                        <div className="flex items-center gap-2">
-                          <select
-                            className="input-field text-sm py-1.5 flex-1"
-                            value={fr.department}
-                            onChange={e => updateForbiddenRule(idx, 'department', e.target.value)}
-                          >
-                            {rulesData.departments.map(d => (
-                              <option key={d} value={d}>{d}</option>
-                            ))}
-                          </select>
-                          <span className="text-xs text-gray-400">禁止入住</span>
-                          <select
-                            className="input-field text-sm py-1.5 flex-1"
-                            value={fr.buildingId}
-                            onChange={e => updateForbiddenRule(idx, 'buildingId', e.target.value)}
-                          >
-                            {rulesData.buildings.map(b => (
-                              <option key={b.id} value={b.id}>{b.name}</option>
-                            ))}
-                          </select>
-                          <button className="p-1.5 text-red-400 hover:text-red-600 hover:bg-red-50 rounded" onClick={() => removeForbiddenRule(idx)}>
-                            <Trash2 className="w-4 h-4" />
-                          </button>
+                    rulesData.forbiddenRules.map((fr, idx) => {
+                      const status = getRuleStatus(fr)
+                      const statusInfo = RULE_STATUS_MAP[status]
+                      return (
+                        <div key={fr.id} className={`p-3 border rounded-lg space-y-2 ${fr.enabled ? 'border-gray-200' : 'border-gray-100 bg-gray-50 opacity-70'}`}>
+                          <div className="flex items-center gap-2">
+                            <input
+                              type="checkbox"
+                              checked={fr.enabled}
+                              onChange={e => updateForbiddenRule(idx, 'enabled', e.target.checked)}
+                              className="w-4 h-4 accent-[#1E3A5F] cursor-pointer"
+                            />
+                            <span className={`px-2 py-0.5 rounded-full text-xs font-medium ${statusInfo.className}`}>
+                              {statusInfo.text}
+                            </span>
+                            <button className="p-1 text-red-400 hover:text-red-600 hover:bg-red-50 rounded ml-auto" onClick={() => removeForbiddenRule(idx)}>
+                              <Trash2 className="w-4 h-4" />
+                            </button>
+                          </div>
+                          <div className="flex items-center gap-2 ml-6">
+                            <select
+                              className="input-field text-sm py-1.5 flex-1"
+                              value={fr.department}
+                              onChange={e => updateForbiddenRule(idx, 'department', e.target.value)}
+                              disabled={!fr.enabled}
+                            >
+                              {rulesData.departments.map(d => (
+                                <option key={d} value={d}>{d}</option>
+                              ))}
+                            </select>
+                            <span className="text-xs text-gray-400">禁止入住</span>
+                            <select
+                              className="input-field text-sm py-1.5 flex-1"
+                              value={fr.buildingId}
+                              onChange={e => updateForbiddenRule(idx, 'buildingId', e.target.value)}
+                              disabled={!fr.enabled}
+                            >
+                              {rulesData.buildings.map(b => (
+                                <option key={b.id} value={b.id}>{b.name}</option>
+                              ))}
+                            </select>
+                          </div>
+                          <input
+                            className="input-field text-sm py-1.5 w-full ml-6"
+                            placeholder="请输入禁住原因..."
+                            value={fr.reason}
+                            onChange={e => updateForbiddenRule(idx, 'reason', e.target.value)}
+                            disabled={!fr.enabled}
+                          />
+                          <div className="flex items-center gap-2 ml-6">
+                            <span className="text-xs text-gray-500 w-16">生效时间:</span>
+                            <input
+                              type="date"
+                              className="input-field text-sm py-1.5 flex-1"
+                              value={fr.startDate || ''}
+                              onChange={e => updateForbiddenRule(idx, 'startDate', e.target.value || null)}
+                              disabled={!fr.enabled}
+                            />
+                            <span className="text-xs text-gray-400">至</span>
+                            <input
+                              type="date"
+                              className="input-field text-sm py-1.5 flex-1"
+                              value={fr.endDate || ''}
+                              onChange={e => updateForbiddenRule(idx, 'endDate', e.target.value || null)}
+                              disabled={!fr.enabled}
+                            />
+                          </div>
+                          <div className="text-xs text-gray-400 ml-6">
+                            留空表示永久生效
+                          </div>
                         </div>
-                        <input
-                          className="input-field text-sm py-1.5 w-full"
-                          placeholder="请输入禁住原因..."
-                          value={fr.reason}
-                          onChange={e => updateForbiddenRule(idx, 'reason', e.target.value)}
-                        />
-                      </div>
-                    ))
+                      )
+                    })
                   )}
                 </div>
               </div>

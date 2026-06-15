@@ -160,17 +160,62 @@ export interface ImportError {
   message: string
 }
 
+export interface FailedRow {
+  row: number
+  data: Record<string, any>
+  message: string
+}
+
+export interface CreatedBuilding {
+  id: string
+  name: string
+  gender: string
+  floors: number
+  totalRooms: number
+  exists?: boolean
+}
+
+export interface CreatedRoom {
+  id: string
+  buildingName: string
+  floor: number
+  roomNumber: string
+  dormitoryType: string
+  capacity: number
+  bedCount: number
+  exists?: boolean
+}
+
+export interface CreatedBed {
+  id: string
+  roomNumber: string
+  bedNumber: number
+  buildingName: string
+  exists?: boolean
+  status?: string | null
+}
+
 export interface ImportHistory {
   id: string
   createdAt: string
   operator: string
-  filename: string
+  fileName: string
   successCount: number
   failedCount: number
   rollbackIds: RollbackIds
   errors: ImportError[]
   status: 'confirmed' | 'rolledback'
   canRollback?: boolean
+  createdBuildings: CreatedBuilding[]
+  createdRooms: CreatedRoom[]
+  createdBeds: CreatedBed[]
+  failedRows: FailedRow[]
+}
+
+export interface ImportHistoryDetail extends ImportHistory {
+  buildings: CreatedBuilding[]
+  rooms: CreatedRoom[]
+  beds: CreatedBed[]
 }
 
 export interface PreviewBuildItem {
@@ -192,7 +237,9 @@ export interface PreviewResult {
   buildings: PreviewBuildItem[]
   rooms: PreviewRoomItem[]
   errors: ImportError[]
+  failedRows: FailedRow[]
   totalNew: number
+  totalBeds: number
 }
 
 export interface ConfirmResult {
@@ -201,12 +248,46 @@ export interface ConfirmResult {
   failedCount: number
   errors: ImportError[]
   rollbackIds: RollbackIds
+  createdBuildings: CreatedBuilding[]
+  createdRooms: CreatedRoom[]
+  createdBeds: CreatedBed[]
+  failedRows: FailedRow[]
+}
+
+export interface RollbackPreviewResult {
+  canRollback: boolean
+  reason: string | null
+  occupiedCount: number
+  occupiedBeds: Array<{
+    id: string
+    bedNumber: number
+    roomNumber: string
+    buildingName: string
+  }>
+  buildingCount: number
+  roomCount: number
+  bedCount: number
+  buildingNames: string[]
+  rooms: Array<{
+    buildingName: string
+    floor: number
+    roomNumber: string
+  }>
+  beds: Array<{
+    buildingName: string
+    roomNumber: string
+    bedNumber: number
+  }>
+  riskWarning: string | null
 }
 
 export interface DepartmentPriority {
   id: string
   department: string
   priority: number
+  enabled: boolean
+  startDate: string | null
+  endDate: string | null
 }
 
 export interface BuildingPreference {
@@ -214,6 +295,9 @@ export interface BuildingPreference {
   department: string
   buildingId: string
   priority: number
+  enabled: boolean
+  startDate: string | null
+  endDate: string | null
   buildingName?: string
 }
 
@@ -222,6 +306,9 @@ export interface ForbiddenRule {
   department: string
   buildingId: string
   reason: string
+  enabled: boolean
+  startDate: string | null
+  endDate: string | null
   buildingName?: string
 }
 
@@ -256,4 +343,70 @@ export interface MatchBedsResult {
   beds: any[]
   department: string
   forbiddenBuildings?: ForbiddenBuildingInfo[]
+}
+
+export interface ExportTask {
+  id: string
+  type: 'operation_log' | 'settlement' | 'dormitory_import'
+  fileName: string
+  scope: 'current' | 'all'
+  filters: Record<string, any>
+  filterDescription: string
+  recordCount: number
+  fileSize: number
+  status: 'completed' | 'failed'
+  operator: string
+  createdAt: string
+  expiresAt?: string
+}
+
+export interface WaterCalculation {
+  previousReading: number
+  currentReading: number
+  usage: number
+  unitPrice: number
+  fee: number
+}
+
+export interface ElectricCalculation {
+  previousReading: number
+  currentReading: number
+  usage: number
+  unitPrice: number
+  fee: number
+}
+
+export interface DamageCalculationItem {
+  id: string
+  name: string
+  amount: number
+  remark: string
+}
+
+export interface DepositCalculation {
+  original: number
+  deducted: number
+  remaining: number
+}
+
+export interface CalculationBreakdown {
+  water: WaterCalculation
+  electric: ElectricCalculation
+  damages: DamageCalculationItem[]
+  damagesTotal: number
+  deposit: DepositCalculation
+  totalFee: number
+  finalFee: number
+}
+
+export interface SettlePreviewResult {
+  waterFee: number
+  electricFee: number
+  damagesTotal: number
+  totalFee: number
+  depositDeducted: number
+  finalFee: number
+  calculationBreakdown: CalculationBreakdown
+  warnings: string[]
+  status: string
 }

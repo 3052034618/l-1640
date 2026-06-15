@@ -121,16 +121,51 @@ export interface RollbackIds {
   bedIds: string[];
 }
 
+export interface CreatedBuilding {
+  id: string;
+  name: string;
+  gender: 'male' | 'female';
+  floors: number;
+  totalRooms: number;
+}
+
+export interface CreatedRoom {
+  id: string;
+  buildingName: string;
+  floor: number;
+  roomNumber: string;
+  dormitoryType: 'single' | 'double' | 'quad';
+  capacity: number;
+  bedCount: number;
+}
+
+export interface CreatedBed {
+  id: string;
+  roomNumber: string;
+  bedNumber: number;
+  buildingName: string;
+}
+
+export interface FailedRow {
+  row: number;
+  data: Record<string, unknown>;
+  message: string;
+}
+
 export interface ImportHistory {
   id: string;
   createdAt: string;
   operator: string;
-  filename: string;
+  fileName: string;
   successCount: number;
   failedCount: number;
   rollbackIds: RollbackIds;
   errors: { row: number; message: string }[];
   status: 'confirmed' | 'rolledback';
+  createdBuildings: CreatedBuilding[];
+  createdRooms: CreatedRoom[];
+  createdBeds: CreatedBed[];
+  failedRows: FailedRow[];
 }
 
 export interface PreviewBuildItem {
@@ -152,7 +187,9 @@ export interface PreviewData {
   buildings: PreviewBuildItem[];
   rooms: PreviewRoomItem[];
   errors: { row: number; message: string }[];
+  failedRows: FailedRow[];
   validData: Record<string, unknown>[];
+  rawData: Record<string, unknown>[];
   filename: string;
   createdAt: string;
 }
@@ -161,6 +198,9 @@ export interface DepartmentPriority {
   id: string;
   department: string;
   priority: number;
+  enabled: boolean;
+  startDate: string | null;
+  endDate: string | null;
 }
 
 export interface BuildingPreference {
@@ -168,6 +208,9 @@ export interface BuildingPreference {
   department: string;
   buildingId: string;
   priority: number;
+  enabled: boolean;
+  startDate: string | null;
+  endDate: string | null;
 }
 
 export interface ForbiddenRule {
@@ -175,12 +218,30 @@ export interface ForbiddenRule {
   department: string;
   buildingId: string;
   reason: string;
+  enabled: boolean;
+  startDate: string | null;
+  endDate: string | null;
 }
 
 export interface AssignmentRule {
   departmentPriorities: DepartmentPriority[];
   buildingPreferences: BuildingPreference[];
   forbiddenRules: ForbiddenRule[];
+}
+
+export interface ExportTask {
+  id: string;
+  type: 'operation_log' | 'settlement' | 'dormitory_import';
+  fileName: string;
+  scope: 'current' | 'all';
+  filters: Record<string, any>;
+  filterDescription: string;
+  recordCount: number;
+  fileSize: number;
+  status: 'completed' | 'failed';
+  operator: string;
+  createdAt: string;
+  expiresAt?: string;
 }
 
 const buildings: Building[] = [];
@@ -197,6 +258,7 @@ const previewCache: Record<string, PreviewData> = {};
 const departmentPriorities: DepartmentPriority[] = [];
 const buildingPreferences: BuildingPreference[] = [];
 const forbiddenRules: ForbiddenRule[] = [];
+const exportTasks: ExportTask[] = [];
 
 function now(): string {
   return new Date().toISOString();
@@ -331,20 +393,31 @@ function seedData() {
     });
   }
 
+  const today = new Date();
+  const nextMonth = new Date(today);
+  nextMonth.setMonth(nextMonth.getMonth() + 1);
+  const lastMonth = new Date(today);
+  lastMonth.setMonth(lastMonth.getMonth() - 1);
+  const twoMonthsAgo = new Date(today);
+  twoMonthsAgo.setMonth(twoMonthsAgo.getMonth() - 2);
+
   departmentPriorities.push(
-    { id: uuidv4(), department: '技术部', priority: 10 },
-    { id: uuidv4(), department: '市场部', priority: 7 },
-    { id: uuidv4(), department: '财务部', priority: 5 },
-    { id: uuidv4(), department: '行政部', priority: 3 },
+    { id: uuidv4(), department: '技术部', priority: 10, enabled: true, startDate: null, endDate: null },
+    { id: uuidv4(), department: '市场部', priority: 7, enabled: true, startDate: null, endDate: null },
+    { id: uuidv4(), department: '财务部', priority: 5, enabled: true, startDate: null, endDate: null },
+    { id: uuidv4(), department: '行政部', priority: 3, enabled: true, startDate: null, endDate: null },
+    { id: uuidv4(), department: '行政部', priority: 8, enabled: true, startDate: today.toISOString().split('T')[0], endDate: nextMonth.toISOString().split('T')[0] },
+    { id: uuidv4(), department: '运维部', priority: 6, enabled: false, startDate: null, endDate: null },
   );
 
   buildingPreferences.push(
-    { id: uuidv4(), department: '技术部', buildingId: b1Id, priority: 9 },
-    { id: uuidv4(), department: '市场部', buildingId: b2Id, priority: 8 },
+    { id: uuidv4(), department: '技术部', buildingId: b1Id, priority: 9, enabled: true, startDate: null, endDate: null },
+    { id: uuidv4(), department: '市场部', buildingId: b2Id, priority: 8, enabled: true, startDate: null, endDate: null },
   );
 
   forbiddenRules.push(
-    { id: uuidv4(), department: '财务部', buildingId: b1Id, reason: '1号楼为技术部专属楼栋' },
+    { id: uuidv4(), department: '财务部', buildingId: b1Id, reason: '1号楼为技术部专属楼栋', enabled: true, startDate: null, endDate: null },
+    { id: uuidv4(), department: '市场部', buildingId: b1Id, reason: '暑期临时禁住1号楼（男生宿舍）', enabled: true, startDate: twoMonthsAgo.toISOString().split('T')[0], endDate: lastMonth.toISOString().split('T')[0] },
   );
 
   const coId = uuidv4();
@@ -467,6 +540,7 @@ const db = {
   departmentPriorities,
   buildingPreferences,
   forbiddenRules,
+  exportTasks,
 };
 
 export default db;

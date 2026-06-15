@@ -10,6 +10,32 @@ function getDepartments(): string[] {
   return Array.from(depts);
 }
 
+function getEffectiveRules() {
+  const now = new Date();
+  const nowStr = now.toISOString().split('T')[0];
+
+  const isEffective = (rule: { enabled: boolean; startDate: string | null; endDate: string | null }) => {
+    if (!rule.enabled) return false;
+    if (rule.startDate && rule.startDate > nowStr) return false;
+    if (rule.endDate && rule.endDate < nowStr) return false;
+    return true;
+  };
+
+  return {
+    departmentPriorities: db.departmentPriorities.filter(isEffective),
+    buildingPreferences: db.buildingPreferences.filter(isEffective),
+    forbiddenRules: db.forbiddenRules.filter(isEffective),
+  };
+}
+
+function getRuleStatus(rule: { enabled: boolean; startDate: string | null; endDate: string | null }): 'active' | 'inactive' | 'expired' | 'upcoming' {
+  const nowStr = new Date().toISOString().split('T')[0];
+  if (!rule.enabled) return 'inactive';
+  if (rule.startDate && rule.startDate > nowStr) return 'upcoming';
+  if (rule.endDate && rule.endDate < nowStr) return 'expired';
+  return 'active';
+}
+
 function getRoomNumber(bedId: string): string {
   const bed = db.beds.find(b => b.id === bedId);
   if (!bed) return '';
@@ -39,7 +65,9 @@ function enrichApplication(a: any) {
 }
 
 function buildMatchedBeds(app: any, includePriority: boolean = true) {
-  const forbiddenBuildings = db.forbiddenRules
+  const effectiveRules = getEffectiveRules();
+
+  const forbiddenBuildings = effectiveRules.forbiddenRules
     .filter(r => r.department === app.department)
     .map(r => r.buildingId);
 
@@ -48,7 +76,7 @@ function buildMatchedBeds(app: any, includePriority: boolean = true) {
   );
 
   const buildingPrefMap = new Map<string, number>();
-  for (const pref of db.buildingPreferences.filter(p => p.department === app.department)) {
+  for (const pref of effectiveRules.buildingPreferences.filter(p => p.department === app.department)) {
     buildingPrefMap.set(pref.buildingId, pref.priority);
   }
 
@@ -126,13 +154,14 @@ function buildMatchedBeds(app: any, includePriority: boolean = true) {
 
 function buildAutoAssignReason(bed: any, app: any): string {
   const reasons: string[] = [];
+  const effectiveRules = getEffectiveRules();
 
-  const deptPriority = db.departmentPriorities.find(dp => dp.department === app.department);
+  const deptPriority = effectiveRules.departmentPriorities.find(dp => dp.department === app.department);
   if (deptPriority) {
     reasons.push(`部门优先级${deptPriority.priority}`);
   }
 
-  const buildingPref = db.buildingPreferences.find(
+  const buildingPref = effectiveRules.buildingPreferences.find(
     bp => bp.department === app.department && bp.buildingId === bed.buildingId
   );
   if (buildingPref) {
@@ -150,53 +179,93 @@ function buildAutoAssignReason(bed: any, app: any): string {
   return reasons.join(' → ');
 }
 
-function validateBedForApprove(bedId: string, app: any): { ok: boolean; statusCode?: number; error?: string } {
+function validateBedForApprove(bedId: string, app: any): { ok: boolean; statusCode?: number; error?: string; errorType?: string; details?: any } {
   const DORM_TYPE_MAP: Record<string, string> = { single: '单人间', double: '双人间', quad: '四人间' };
   const GENDER_MAP: Record<string, string> = { male: '男', female: '女' };
 
   const bed = db.beds.find(b => b.id === bedId);
-  if (!bed) return { ok: false, statusCode: 404, error: '所选床位不存在' };
+  if (!bed) return { ok: false, statusCode: 404, error: '所选床位不存在', errorType: 'bed_not_found' };
 
   if (bed.status !== 'available') {
-    return { ok: false, statusCode: 409, error: '床位已被占用，请重新选择' };
+    return { ok: false, statusCode: 409, error: '床位已被占用，请重新选择', errorType: 'bed_occupied' };
   }
 
   const room = db.rooms.find(r => r.id === bed.roomId);
-  if (!room) return { ok: false, statusCode: 404, error: '床位所在房间不存在' };
+  if (!room) return { ok: false, statusCode: 404, error: '所选床位不存在', errorType: 'bed_not_found' };
 
   if (room.dormitoryType !== app.dormitoryType) {
     return {
       ok: false,
       statusCode: 409,
-      error: `房型不匹配：申请${DORM_TYPE_MAP[app.dormitoryType] || app.dormitoryType}，床位属于${DORM_TYPE_MAP[room.dormitoryType] || room.dormitoryType}`,
+      error: '房型不匹配',
+      errorType: 'type_mismatch',
+      details: {
+        applied: DORM_TYPE_MAP[app.dormitoryType] || app.dormitoryType,
+        actual: DORM_TYPE_MAP[room.dormitoryType] || room.dormitoryType,
+      },
     };
   }
 
   const building = db.buildings.find(b => b.id === room.buildingId);
-  if (!building) return { ok: false, statusCode: 404, error: '床位所在楼栋不存在' };
+  if (!building) return { ok: false, statusCode: 404, error: '所选床位不存在', errorType: 'bed_not_found' };
 
   if (building.gender !== app.gender) {
-    return { ok: false, statusCode: 409, error: `性别不匹配：该床位属于${GENDER_MAP[building.gender] || building.gender}生宿舍楼` };
+    return {
+      ok: false,
+      statusCode: 409,
+      error: '性别不匹配',
+      errorType: 'gender_mismatch',
+      details: {
+        applied: GENDER_MAP[app.gender] || app.gender,
+        buildingGender: GENDER_MAP[building.gender] || building.gender,
+        buildingName: building.name,
+      },
+    };
   }
 
-  const forbidden = db.forbiddenRules.find(
+  const effectiveRules = getEffectiveRules();
+  const forbidden = effectiveRules.forbiddenRules.find(
     r => r.department === app.department && r.buildingId === building.id
   );
   if (forbidden) {
-    return { ok: false, statusCode: 409, error: `禁住规则冲突：${forbidden.reason}` };
+    return {
+      ok: false,
+      statusCode: 409,
+      error: '违反禁住规则',
+      errorType: 'forbidden_violation',
+      details: {
+        department: app.department,
+        buildingName: building.name,
+        reason: forbidden.reason,
+      },
+    };
   }
 
   const activeAssignments = db.applications.filter(
     a => a.employeeId === app.employeeId && a.status === 'assigned' && a.id !== app.id,
   );
-  const hasActiveAssignment = activeAssignments.some(activeApp => {
+  const activeAssignment = activeAssignments.find(activeApp => {
     const hasCompletedCheckout = db.checkouts.some(
       c => c.applicationId === activeApp.id && c.status === 'completed',
     );
     return !hasCompletedCheckout;
   });
-  if (hasActiveAssignment) {
-    return { ok: false, statusCode: 409, error: '该员工已有生效入住，不能重复分配' };
+  if (activeAssignment) {
+    let currentRoom = '';
+    let startDate = '';
+    const activeBed = db.beds.find(b => b.id === activeAssignment.bedId);
+    if (activeBed) {
+      const activeRoom = db.rooms.find(r => r.id === activeBed.roomId);
+      if (activeRoom) currentRoom = activeRoom.roomNumber;
+    }
+    startDate = activeAssignment.startDate ? new Date(activeAssignment.startDate).toLocaleDateString('zh-CN') : '';
+    return {
+      ok: false,
+      statusCode: 409,
+      error: '该员工已有生效入住',
+      errorType: 'duplicate_checkin',
+      details: { currentRoom, startDate },
+    };
   }
 
   return { ok: true };
@@ -205,18 +274,56 @@ function validateBedForApprove(bedId: string, app: any): { ok: boolean; statusCo
 router.get('/rules', (_req: Request, res: Response) => {
   const departments = getDepartments();
   const buildings = db.buildings.map(b => ({ id: b.id, name: b.name, gender: b.gender }));
+  const effectiveRules = getEffectiveRules();
+  const serverTime = new Date().toISOString();
+
+  const allDepartmentPriorities = db.departmentPriorities.map(dp => ({
+    ...dp,
+    status: getRuleStatus(dp),
+  }));
+
+  const allBuildingPreferences = db.buildingPreferences.map(bp => {
+    const b = db.buildings.find(x => x.id === bp.buildingId);
+    return { ...bp, buildingName: b?.name || '', status: getRuleStatus(bp) };
+  });
+
+  const allForbiddenRules = db.forbiddenRules.map(fr => {
+    const b = db.buildings.find(x => x.id === fr.buildingId);
+    return { ...fr, buildingName: b?.name || '', status: getRuleStatus(fr) };
+  });
+
+  const effectiveDepartmentPriorities = effectiveRules.departmentPriorities;
+  const effectiveBuildingPreferences = effectiveRules.buildingPreferences.map(bp => {
+    const b = db.buildings.find(x => x.id === bp.buildingId);
+    return { ...bp, buildingName: b?.name || '' };
+  });
+  const effectiveForbiddenRules = effectiveRules.forbiddenRules.map(fr => {
+    const b = db.buildings.find(x => x.id === fr.buildingId);
+    return { ...fr, buildingName: b?.name || '' };
+  });
+
   res.json({
-    departmentPriorities: [...db.departmentPriorities],
-    buildingPreferences: db.buildingPreferences.map(bp => {
-      const b = db.buildings.find(x => x.id === bp.buildingId);
-      return { ...bp, buildingName: b?.name || '' };
-    }),
-    forbiddenRules: db.forbiddenRules.map(fr => {
-      const b = db.buildings.find(x => x.id === fr.buildingId);
-      return { ...fr, buildingName: b?.name || '' };
-    }),
+    effectiveRules: {
+      departmentPriorities: effectiveDepartmentPriorities,
+      buildingPreferences: effectiveBuildingPreferences,
+      forbiddenRules: effectiveForbiddenRules,
+    },
+    allRules: {
+      departmentPriorities: allDepartmentPriorities,
+      buildingPreferences: allBuildingPreferences,
+      forbiddenRules: allForbiddenRules,
+    },
+    departmentPriorities: allDepartmentPriorities,
+    buildingPreferences: allBuildingPreferences,
+    forbiddenRules: allForbiddenRules,
     departments,
     buildings,
+    serverTime,
+    effectiveCounts: {
+      departmentPriorities: effectiveDepartmentPriorities.length,
+      buildingPreferences: effectiveBuildingPreferences.length,
+      forbiddenRules: effectiveForbiddenRules.length,
+    },
   });
 });
 
@@ -230,6 +337,9 @@ router.put('/rules', (req: Request, res: Response) => {
         id: dp.id || uuidv4(),
         department: dp.department,
         priority: Math.max(1, Math.min(10, Number(dp.priority) || 5)),
+        enabled: dp.enabled !== undefined ? Boolean(dp.enabled) : true,
+        startDate: dp.startDate || null,
+        endDate: dp.endDate || null,
       });
     }
   }
@@ -242,6 +352,9 @@ router.put('/rules', (req: Request, res: Response) => {
         department: bp.department,
         buildingId: bp.buildingId,
         priority: Math.max(1, Math.min(10, Number(bp.priority) || 5)),
+        enabled: bp.enabled !== undefined ? Boolean(bp.enabled) : true,
+        startDate: bp.startDate || null,
+        endDate: bp.endDate || null,
       });
     }
   }
@@ -254,6 +367,9 @@ router.put('/rules', (req: Request, res: Response) => {
         department: fr.department,
         buildingId: fr.buildingId,
         reason: fr.reason || '',
+        enabled: fr.enabled !== undefined ? Boolean(fr.enabled) : true,
+        startDate: fr.startDate || null,
+        endDate: fr.endDate || null,
       });
     }
   }
@@ -325,8 +441,9 @@ router.get('/:id/match-beds', (req: Request, res: Response) => {
   }
 
   const sorted = buildMatchedBeds(app);
+  const effectiveRules = getEffectiveRules();
 
-  const forbiddenBuildings = db.forbiddenRules
+  const forbiddenBuildings = effectiveRules.forbiddenRules
     .filter(r => r.department === app.department)
     .map(r => {
       const b = db.buildings.find(x => x.id === r.buildingId);
@@ -399,7 +516,11 @@ router.put('/:id/approve', (req: Request, res: Response) => {
 
   const validation = validateBedForApprove(bedId, app);
   if (!validation.ok) {
-    res.status(validation.statusCode || 409).json({ error: validation.error || '校验失败' });
+    const response: any = { error: validation.error || '校验失败', errorType: validation.errorType };
+    if (validation.details) {
+      response.details = validation.details;
+    }
+    res.status(validation.statusCode || 409).json(response);
     return;
   }
 

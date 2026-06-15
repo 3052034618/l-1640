@@ -2,10 +2,11 @@ import { useEffect, useState, useMemo } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
 import {
   ArrowLeft, CheckCircle2, Droplets, Zap, BedDouble, Plus, Trash2,
-  FileSpreadsheet, FileText, AlertTriangle, Wallet, Calculator
+  FileSpreadsheet, FileText, AlertTriangle, Wallet, Calculator,
+  ArrowLeftCircle, CheckCheck
 } from 'lucide-react'
 import { v4 as uuidv4 } from 'uuid'
-import type { Checkout, ChecklistItem, DamageItem } from '@/types'
+import type { Checkout, ChecklistItem, DamageItem, SettlePreviewResult, CalculationBreakdown } from '@/types'
 import { formatStatus, statusBadgeClass } from '@/lib/helpers'
 import jsPDF from 'jspdf'
 import autoTable from 'jspdf-autotable'
@@ -64,6 +65,10 @@ export default function CheckoutDetail() {
   const [waterReading, setWaterReading] = useState('')
   const [electricReading, setElectricReading] = useState('')
   const [damages, setDamages] = useState<DamageItem[]>([])
+  const [depositDeductedInput, setDepositDeductedInput] = useState('')
+  const [settleSubStep, setSettleSubStep] = useState<'fill' | 'review'>('fill')
+  const [previewResult, setPreviewResult] = useState<SettlePreviewResult | null>(null)
+  const [settleError, setSettleError] = useState<{ errorType: string; message: string; details?: any } | null>(null)
   const [exporting, setExporting] = useState(false)
 
   const loadData = async () => {
@@ -80,6 +85,9 @@ export default function CheckoutDetail() {
       if (coData.waterReading) setWaterReading(String(coData.waterReading))
       if (coData.electricReading) setElectricReading(String(coData.electricReading))
       setDamages(coData.facilityDamages || [])
+      if (coData.depositDeducted !== undefined && coData.depositDeducted !== null) {
+        setDepositDeductedInput(String(coData.depositDeducted))
+      }
     } catch {}
     finally { setLoading(false) }
   }
@@ -105,12 +113,21 @@ export default function CheckoutDetail() {
   const electricFee = useMemo(() => Math.round(Math.max(0, er - per) * 0.8 * 100) / 100, [er, per])
   const damagesTotal = useMemo(() => Math.round(damages.reduce((s, d) => s + (Number(d.amount) || 0), 0) * 100) / 100, [damages])
   const deposit = checkout?.deposit || 500
+
+  const depositDed = useMemo(() => {
+    const d = Number(depositDeductedInput)
+    if (isNaN(d) || d < 0) return 0
+    return Math.min(d, deposit)
+  }, [depositDeductedInput, deposit])
+
   const totalFee = Math.round((waterFee + electricFee + damagesTotal) * 100) / 100
-  const depositDeducted = Math.round(Math.min(totalFee, deposit) * 100) / 100
-  const finalFee = Math.round((totalFee - depositDeducted) * 100) / 100
+  const displayDepositDeducted = previewResult ? previewResult.depositDeducted : depositDed
+  const finalFee = Math.round((totalFee - displayDepositDeducted) * 100) / 100
   const finalFeeInvalid = finalFee < 0
 
-  const canSettle = !hasPendingItems && !readingsInvalid && !finalFeeInvalid &&
+  const depositDeductionInvalid = depositDed < 0 || depositDed > deposit
+
+  const canPreview = !hasPendingItems && !readingsInvalid && !depositDeductionInvalid &&
     waterReading !== '' && electricReading !== ''
 
   const addDamageItem = () => {
@@ -150,9 +167,10 @@ export default function CheckoutDetail() {
     finally { setSubmitting(false) }
   }
 
-  const handleSettle = async () => {
-    if (!canSettle) return
+  const handlePreviewSettle = async () => {
     setSubmitting(true)
+    setSettleError(null)
+    setPreviewResult(null)
     try {
       const res = await fetch(`/api/checkouts/${id}/settle`, {
         method: 'PUT', headers: { 'Content-Type': 'application/json' },
@@ -160,6 +178,39 @@ export default function CheckoutDetail() {
           waterReading: wr,
           electricReading: er,
           facilityDamages: damages,
+          depositDeducted: depositDed,
+        }),
+      })
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}))
+        setSettleError({
+          errorType: data.errorType || 'unknown',
+          message: data.error || '操作失败',
+          details: data.details,
+        })
+        setSettleSubStep('review')
+        return
+      }
+      const data = await res.json()
+      setPreviewResult(data)
+      setSettleSubStep('review')
+    } catch (e) {
+      alert(e instanceof Error ? e.message : '操作失败')
+    }
+    finally { setSubmitting(false) }
+  }
+
+  const handleGenerateInvoice = async () => {
+    if (!previewResult) return
+    setSubmitting(true)
+    try {
+      const res = await fetch(`/api/checkouts/${id}/generate-invoice`, {
+        method: 'PUT', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          waterReading: wr,
+          electricReading: er,
+          facilityDamages: damages,
+          depositDeducted: depositDed,
         }),
       })
       if (!res.ok) {
@@ -168,10 +219,17 @@ export default function CheckoutDetail() {
       }
       const updated = await res.json()
       setCheckout(updated)
+      setSettleSubStep('fill')
+      setPreviewResult(null)
     } catch (e) {
       alert(e instanceof Error ? e.message : '操作失败')
     }
     finally { setSubmitting(false) }
+  }
+
+  const handleBackToFill = () => {
+    setSettleSubStep('fill')
+    setSettleError(null)
   }
 
   const toggleItem = (itemId: string, status: string) => {
@@ -511,11 +569,11 @@ export default function CheckoutDetail() {
         </div>
       )}
 
-      {currentStep === 2 && (
+      {currentStep === 2 && settleSubStep === 'fill' && (
         <div className="card p-6 space-y-6">
           <div className="flex items-center gap-2 mb-2">
             <Calculator className="w-5 h-5 text-[#1E3A5F]" />
-            <h3 className="font-bold text-gray-900">费用结算</h3>
+            <h3 className="font-bold text-gray-900">费用结算 - 填写信息</h3>
           </div>
 
           {hasPendingItems && (
@@ -625,11 +683,22 @@ export default function CheckoutDetail() {
               </div>
               <div className="bg-white rounded-lg p-4 shadow-sm">
                 <p className="text-xs text-gray-500 mb-1">抵扣金额</p>
-                <p className="text-xl font-bold text-orange-600">¥{depositDeducted.toFixed(2)}</p>
+                <div className="mt-1">
+                  <input
+                    type="number"
+                    className={`input-field text-base text-right font-bold ${depositDeductionInvalid ? 'border-red-400 text-red-600' : 'text-orange-600'}`}
+                    value={depositDeductedInput}
+                    onChange={e => setDepositDeductedInput(e.target.value)}
+                    min="0"
+                    max={deposit}
+                    step="0.01"
+                  />
+                </div>
+                <p className="text-xs text-gray-400 mt-1">可手动调整，最大 ¥{deposit.toFixed(2)}</p>
               </div>
               <div className="bg-white rounded-lg p-4 shadow-sm">
                 <p className="text-xs text-gray-500 mb-1">剩余押金</p>
-                <p className="text-xl font-bold text-emerald-600">¥{(deposit - depositDeducted).toFixed(2)}</p>
+                <p className="text-xl font-bold text-emerald-600">¥{(deposit - depositDed).toFixed(2)}</p>
               </div>
             </div>
           </div>
@@ -643,7 +712,7 @@ export default function CheckoutDetail() {
               <div className="flex justify-between py-1.5"><span className="text-gray-500">电费</span><span>¥{electricFee.toFixed(2)}</span></div>
               <div className="flex justify-between py-1.5"><span className="text-gray-500">设施赔偿</span><span>¥{damagesTotal.toFixed(2)}</span></div>
               <div className="flex justify-between py-1.5 border-t border-gray-300/50"><span className="text-gray-500">总费用</span><span className="font-medium">¥{totalFee.toFixed(2)}</span></div>
-              <div className="flex justify-between py-1.5 text-orange-600"><span>押金抵扣</span><span>- ¥{depositDeducted.toFixed(2)}</span></div>
+              <div className="flex justify-between py-1.5 text-orange-600"><span>押金抵扣</span><span>- ¥{depositDed.toFixed(2)}</span></div>
               <div className={`flex justify-between py-3 border-t-2 ${finalFeeInvalid ? 'border-red-300' : 'border-[#1E3A5F]'} mt-2`}>
                 <span className="font-bold text-base">最终实付</span>
                 <span className={`text-2xl font-bold ${finalFeeInvalid ? 'text-red-600' : 'text-[#1E3A5F]'}`}>
@@ -657,12 +726,195 @@ export default function CheckoutDetail() {
           </div>
 
           <div className="flex gap-3 pt-2">
-            <button className="btn-primary" disabled={submitting || !canSettle} onClick={handleSettle}>
-              {submitting ? '处理中...' : '确认结算并完成退宿'}
+            <button className="btn-primary" disabled={submitting || !canPreview} onClick={handlePreviewSettle}>
+              {submitting ? '处理中...' : '计算并复核'}
             </button>
-            {!canSettle && (
+            {!canPreview && (
               <span className="text-sm text-red-500 self-center">
-                {hasPendingItems ? '请先完成检查项' : readingsInvalid ? '请核对水电读数' : finalFeeInvalid ? '费用异常' : '请填写水电读数'}
+                {hasPendingItems ? '请先完成检查项' : readingsInvalid ? '请核对水电读数' : depositDeductionInvalid ? '押金抵扣金额无效' : '请填写水电读数'}
+              </span>
+            )}
+          </div>
+        </div>
+      )}
+
+      {currentStep === 2 && settleSubStep === 'review' && (
+        <div className="card p-6 space-y-6">
+          <div className="flex items-center gap-2 mb-2">
+            <CheckCheck className="w-5 h-5 text-[#1E3A5F]" />
+            <h3 className="font-bold text-gray-900">账单复核</h3>
+          </div>
+
+          {settleError && (
+            <div className="bg-red-50 border border-red-200 rounded-lg p-4 text-sm text-red-800">
+              <div className="flex items-center gap-2 font-medium mb-2">
+                <AlertTriangle className="w-5 h-5" />
+                校验失败 - {settleError.message}
+              </div>
+              {settleError.details && Array.isArray(settleError.details) && (
+                <ul className="list-disc list-inside mt-2 space-y-1 text-red-700">
+                  {settleError.details.map((d: string, i: number) => (
+                    <li key={i}>{d}</li>
+                  ))}
+                </ul>
+              )}
+            </div>
+          )}
+
+          {previewResult?.warnings && previewResult.warnings.length > 0 && (
+            <div className="bg-amber-50 border border-amber-200 rounded-lg p-4 text-sm text-amber-800">
+              <div className="flex items-center gap-2 font-medium mb-2">
+                <AlertTriangle className="w-5 h-5" />
+                异常金额提示
+              </div>
+              <ul className="list-disc list-inside space-y-1">
+                {previewResult.warnings.map((w, i) => (
+                  <li key={i}>{w}</li>
+                ))}
+              </ul>
+            </div>
+          )}
+
+          {previewResult?.calculationBreakdown && (
+            <>
+              <div className="bg-blue-50/50 rounded-xl p-5 border border-blue-100">
+                <h4 className="font-semibold text-gray-800 mb-4 flex items-center gap-2">
+                  <Droplets className="w-4 h-4 text-blue-500" /> 水电用量明细
+                </h4>
+                <div className="overflow-hidden rounded-lg border border-blue-100">
+                  <table className="w-full text-sm">
+                    <thead className="bg-blue-100/50">
+                      <tr>
+                        <th className="px-4 py-2 text-left text-xs font-medium text-gray-600">项目</th>
+                        <th className="px-4 py-2 text-right text-xs font-medium text-gray-600">上次读数</th>
+                        <th className="px-4 py-2 text-right text-xs font-medium text-gray-600">本次读数</th>
+                        <th className="px-4 py-2 text-right text-xs font-medium text-gray-600">用量</th>
+                        <th className="px-4 py-2 text-right text-xs font-medium text-gray-600">单价</th>
+                        <th className="px-4 py-2 text-right text-xs font-medium text-gray-600">费用</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-blue-100">
+                      <tr className="bg-white">
+                        <td className="px-4 py-3">水费</td>
+                        <td className="px-4 py-3 text-right">{previewResult.calculationBreakdown.water.previousReading} 吨</td>
+                        <td className="px-4 py-3 text-right">{previewResult.calculationBreakdown.water.currentReading} 吨</td>
+                        <td className="px-4 py-3 text-right font-medium">{previewResult.calculationBreakdown.water.usage} 吨</td>
+                        <td className="px-4 py-3 text-right text-gray-500">¥{previewResult.calculationBreakdown.water.unitPrice}/吨</td>
+                        <td className="px-4 py-3 text-right font-semibold text-blue-700">¥{previewResult.calculationBreakdown.water.fee.toFixed(2)}</td>
+                      </tr>
+                      <tr className="bg-white">
+                        <td className="px-4 py-3">电费</td>
+                        <td className="px-4 py-3 text-right">{previewResult.calculationBreakdown.electric.previousReading} 度</td>
+                        <td className="px-4 py-3 text-right">{previewResult.calculationBreakdown.electric.currentReading} 度</td>
+                        <td className="px-4 py-3 text-right font-medium">{previewResult.calculationBreakdown.electric.usage} 度</td>
+                        <td className="px-4 py-3 text-right text-gray-500">¥{previewResult.calculationBreakdown.electric.unitPrice}/度</td>
+                        <td className="px-4 py-3 text-right font-semibold text-amber-700">¥{previewResult.calculationBreakdown.electric.fee.toFixed(2)}</td>
+                      </tr>
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+
+              <div className="border border-gray-200 rounded-xl p-5">
+                <h4 className="font-semibold text-gray-800 mb-4 flex items-center gap-2">
+                  <AlertTriangle className="w-4 h-4 text-orange-500" /> 设施赔偿明细
+                </h4>
+                {previewResult.calculationBreakdown.damages.length === 0 ? (
+                  <div className="text-center py-6 text-gray-400 text-sm bg-gray-50 rounded-lg">
+                    无设施赔偿项
+                  </div>
+                ) : (
+                  <div className="overflow-hidden rounded-lg border border-gray-200">
+                    <table className="w-full text-sm">
+                      <thead className="bg-gray-50">
+                        <tr>
+                          <th className="px-4 py-2 text-left text-xs font-medium text-gray-600">序号</th>
+                          <th className="px-4 py-2 text-left text-xs font-medium text-gray-600">项目名称</th>
+                          <th className="px-4 py-2 text-right text-xs font-medium text-gray-600">金额(元)</th>
+                          <th className="px-4 py-2 text-left text-xs font-medium text-gray-600">备注</th>
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-gray-200 bg-white">
+                        {previewResult.calculationBreakdown.damages.map((d, i) => (
+                          <tr key={d.id}>
+                            <td className="px-4 py-3 text-gray-500">{i + 1}</td>
+                            <td className="px-4 py-3 font-medium">{d.name}</td>
+                            <td className="px-4 py-3 text-right font-semibold text-orange-600">¥{d.amount.toFixed(2)}</td>
+                            <td className="px-4 py-3 text-gray-500">{d.remark || '-'}</td>
+                          </tr>
+                        ))}
+                        <tr className="bg-gray-50 font-semibold">
+                          <td className="px-4 py-3" colSpan={2}>赔偿合计</td>
+                          <td className="px-4 py-3 text-right text-orange-700">¥{previewResult.calculationBreakdown.damagesTotal.toFixed(2)}</td>
+                          <td className="px-4 py-3"></td>
+                        </tr>
+                      </tbody>
+                    </table>
+                  </div>
+                )}
+              </div>
+
+              <div className="bg-gradient-to-br from-emerald-50 to-teal-50 border border-emerald-200 rounded-xl p-5">
+                <h4 className="font-semibold text-gray-800 mb-4 flex items-center gap-2">
+                  <Wallet className="w-4 h-4 text-emerald-600" /> 押金抵扣
+                </h4>
+                <div className="grid grid-cols-3 gap-4">
+                  <div className="bg-white rounded-lg p-4 shadow-sm">
+                    <p className="text-xs text-gray-500 mb-1">原始押金</p>
+                    <p className="text-xl font-bold text-gray-800">¥{previewResult.calculationBreakdown.deposit.original.toFixed(2)}</p>
+                  </div>
+                  <div className="bg-white rounded-lg p-4 shadow-sm">
+                    <p className="text-xs text-gray-500 mb-1">抵扣金额</p>
+                    <p className="text-xl font-bold text-orange-600">¥{previewResult.calculationBreakdown.deposit.deducted.toFixed(2)}</p>
+                  </div>
+                  <div className="bg-white rounded-lg p-4 shadow-sm">
+                    <p className="text-xs text-gray-500 mb-1">剩余押金</p>
+                    <p className="text-xl font-bold text-emerald-600">¥{previewResult.calculationBreakdown.deposit.remaining.toFixed(2)}</p>
+                  </div>
+                </div>
+              </div>
+
+              <div className="bg-gray-50 rounded-xl p-5 border border-gray-200">
+                <h4 className="font-semibold text-gray-800 mb-4 flex items-center gap-2">
+                  <Calculator className="w-4 h-4" /> 费用总计
+                </h4>
+                <div className="space-y-2 text-sm max-w-md ml-auto">
+                  <div className="flex justify-between py-1.5"><span className="text-gray-500">水费</span><span>¥{previewResult.calculationBreakdown.water.fee.toFixed(2)}</span></div>
+                  <div className="flex justify-between py-1.5"><span className="text-gray-500">电费</span><span>¥{previewResult.calculationBreakdown.electric.fee.toFixed(2)}</span></div>
+                  <div className="flex justify-between py-1.5"><span className="text-gray-500">设施赔偿</span><span>¥{previewResult.calculationBreakdown.damagesTotal.toFixed(2)}</span></div>
+                  <div className="flex justify-between py-1.5 border-t border-gray-300/50"><span className="text-gray-500">总费用</span><span className="font-medium">¥{previewResult.calculationBreakdown.totalFee.toFixed(2)}</span></div>
+                  <div className="flex justify-between py-1.5 text-orange-600"><span>押金抵扣</span><span>- ¥{previewResult.calculationBreakdown.deposit.deducted.toFixed(2)}</span></div>
+                  <div className="flex justify-between py-3 border-t-2 border-[#1E3A5F] mt-2">
+                    <span className="font-bold text-base">最终实付</span>
+                    <span className="text-2xl font-bold text-[#1E3A5F]">
+                      ¥{previewResult.calculationBreakdown.finalFee.toFixed(2)}
+                    </span>
+                  </div>
+                </div>
+              </div>
+            </>
+          )}
+
+          <div className="flex gap-3 pt-2">
+            <button
+              className="px-4 py-2 rounded-lg text-sm border border-gray-300 text-gray-700 hover:bg-gray-50 transition-colors flex items-center gap-2"
+              onClick={handleBackToFill}
+              disabled={submitting}
+            >
+              <ArrowLeftCircle className="w-4 h-4" />
+              返回修改
+            </button>
+            <button
+              className="btn-primary flex items-center gap-2"
+              disabled={submitting || !previewResult || !!settleError}
+              onClick={handleGenerateInvoice}
+            >
+              <CheckCircle2 className="w-4 h-4" />
+              {submitting ? '处理中...' : '确认生成账单'}
+            </button>
+            {settleError && (
+              <span className="text-sm text-red-500 self-center">
+                请先修正错误后再生成账单
               </span>
             )}
           </div>

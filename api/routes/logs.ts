@@ -1,6 +1,8 @@
 import { Router, type Request, type Response } from 'express';
 import * as XLSX from 'xlsx';
+import { v4 as uuidv4 } from 'uuid';
 import db from '../db.js';
+
 
 const router = Router();
 
@@ -114,7 +116,7 @@ router.get('/export', (req: Request, res: Response) => {
   const filtered = filterLogs(filters);
   const result = applyScope(filtered, String(scope), Number(page), Number(pageSize));
 
-  const now = new Date().toLocaleString('zh-CN');
+  const nowStr = new Date().toLocaleString('zh-CN');
   const scopeLabel = scope === 'current' ? '当前页' : '全部';
   const filterDesc = buildFilterDesc(filters);
 
@@ -128,7 +130,7 @@ router.get('/export', (req: Request, res: Response) => {
 
   const headerRow = ['时间', '操作人', '操作类型', '房间编号', '描述'];
   const metaRow1 = ['操作日志导出报表', '', '', '', ''];
-  const metaRow2 = [`导出时间：${now} | 筛选条件：${filterDesc} | 范围=${scopeLabel}`, '', '', '', ''];
+  const metaRow2 = [`导出时间：${nowStr} | 筛选条件：${filterDesc} | 范围=${scopeLabel}`, '', '', '', ''];
   const emptyRow = ['', '', '', '', ''];
 
   const aoa: (string | undefined)[][] = [
@@ -166,9 +168,44 @@ router.get('/export', (req: Request, res: Response) => {
   XLSX.utils.book_append_sheet(wb, ws, '操作日志');
 
   const buffer = XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' });
+  const fileName = `operation_logs_${new Date().toISOString().slice(0, 10)}_${uuidv4().slice(0, 8)}.xlsx`;
+  const fileSize = buffer.length;
+  const recordCount = result.list.length;
+
+  const expiresAt = new Date();
+  expiresAt.setDate(expiresAt.getDate() + 7);
+
+  db.exportTasks.unshift({
+    id: uuidv4(),
+    type: 'operation_log',
+    fileName,
+    scope: scope as 'current' | 'all',
+    filters: { ...filters, page: Number(page), pageSize: Number(pageSize) },
+    filterDescription: filterDesc,
+    recordCount,
+    fileSize,
+    status: 'completed',
+    operator: '系统管理员',
+    createdAt: new Date().toISOString(),
+    expiresAt: expiresAt.toISOString(),
+  });
+
   res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
-  res.setHeader('Content-Disposition', 'attachment; filename=operation_logs.xlsx');
+  res.setHeader('Content-Disposition', `attachment; filename=${fileName}`);
   res.send(buffer);
+});
+
+router.get('/export-tasks', (req: Request, res: Response) => {
+  const { page = '1', pageSize = '10' } = req.query;
+  const pageNum = Number(page);
+  const pageSizeNum = Number(pageSize);
+
+  const tasks = db.exportTasks.filter(t => t.type === 'operation_log');
+  const total = tasks.length;
+  const start = (pageNum - 1) * pageSizeNum;
+  const list = tasks.slice(start, start + pageSizeNum);
+
+  res.json({ total, list });
 });
 
 export default router;

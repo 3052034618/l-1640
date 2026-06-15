@@ -1,7 +1,17 @@
 import { Router, type Request, type Response } from 'express';
 import { v4 as uuidv4 } from 'uuid';
 import db from '../db.js';
-import type { PreviewData, PreviewBuildItem, PreviewRoomItem, RollbackIds } from '../db.js';
+import type {
+  PreviewData,
+  PreviewBuildItem,
+  PreviewRoomItem,
+  RollbackIds,
+  CreatedBuilding,
+  CreatedRoom,
+  CreatedBed,
+  FailedRow,
+  ImportHistory,
+} from '../db.js';
 
 const router = Router();
 
@@ -20,6 +30,7 @@ interface ValidateResult {
   buildings: PreviewBuildItem[];
   rooms: PreviewRoomItem[];
   errors: { row: number; message: string }[];
+  failedRows: FailedRow[];
   validData: Record<string, unknown>[];
 }
 
@@ -27,6 +38,7 @@ const validateData = (data: Record<string, unknown>[]): ValidateResult => {
   const buildings: PreviewBuildItem[] = [];
   const rooms: PreviewRoomItem[] = [];
   const errors: { row: number; message: string }[] = [];
+  const failedRows: FailedRow[] = [];
   const validData: Record<string, unknown>[] = [];
   const buildingNames = new Set<string>();
   const existingBuildingMap: Record<string, PreviewBuildItem> = {};
@@ -53,7 +65,9 @@ const validateData = (data: Record<string, unknown>[]): ValidateResult => {
     if (!typeRaw || !typeMap[typeRaw]) rowErrors.push(`房型"${typeRaw}"无效，应为单人间/双人间/四人间`);
 
     if (rowErrors.length > 0) {
-      errors.push({ row: rowNum, message: rowErrors.join('；') });
+      const msg = rowErrors.join('；');
+      errors.push({ row: rowNum, message: msg });
+      failedRows.push({ row: rowNum, data: { ...row }, message: msg });
       continue;
     }
 
@@ -66,18 +80,24 @@ const validateData = (data: Record<string, unknown>[]): ValidateResult => {
     const existingBuilding = db.buildings.find(b => b.name === buildingName);
     if (existingBuilding) {
       if (existingBuilding.gender !== gender) {
-        errors.push({ row: rowNum, message: `楼栋"${buildingName}"性别为${existingBuilding.gender === 'male' ? '男' : '女'}生，与当前行${genderRaw}生不一致` });
+        const msg = `楼栋"${buildingName}"性别为${existingBuilding.gender === 'male' ? '男' : '女'}生，与当前行${genderRaw}生不一致`;
+        errors.push({ row: rowNum, message: msg });
+        failedRows.push({ row: rowNum, data: { ...row }, message: msg });
         continue;
       }
       if (floor > existingBuilding.floors) {
-        errors.push({ row: rowNum, message: `楼层${floor}超出楼栋"${buildingName}"的总楼层数${existingBuilding.floors}` });
+        const msg = `楼层${floor}超出楼栋"${buildingName}"的总楼层数${existingBuilding.floors}`;
+        errors.push({ row: rowNum, message: msg });
+        failedRows.push({ row: rowNum, data: { ...row }, message: msg });
         continue;
       }
     } else {
       if (!buildingNames.has(buildingName)) {
         const prev = existingBuildingMap[buildingName];
         if (prev && prev.gender !== gender) {
-          errors.push({ row: rowNum, message: `楼栋"${buildingName}"性别不一致` });
+          const msg = `楼栋"${buildingName}"性别不一致`;
+          errors.push({ row: rowNum, message: msg });
+          failedRows.push({ row: rowNum, data: { ...row }, message: msg });
           continue;
         }
         if (floor > prev.floors) {
@@ -96,13 +116,17 @@ const validateData = (data: Record<string, unknown>[]): ValidateResult => {
       return b && r.roomNumber === roomNumber;
     });
     if (existingRoom) {
-      errors.push({ row: rowNum, message: `房间号${roomNumber}在楼栋"${buildingName}"中已存在` });
+      const msg = `房间号${roomNumber}在楼栋"${buildingName}"中已存在`;
+      errors.push({ row: rowNum, message: msg });
+      failedRows.push({ row: rowNum, data: { ...row }, message: msg });
       continue;
     }
 
     const roomKey = `${buildingName}-${roomNumber}`;
     if (roomKeySet.has(roomKey)) {
-      errors.push({ row: rowNum, message: `房间号${roomNumber}在导入数据中重复` });
+      const msg = `房间号${roomNumber}在导入数据中重复`;
+      errors.push({ row: rowNum, message: msg });
+      failedRows.push({ row: rowNum, data: { ...row }, message: msg });
       continue;
     }
     roomKeySet.add(roomKey);
@@ -111,7 +135,7 @@ const validateData = (data: Record<string, unknown>[]): ValidateResult => {
     validData.push(row);
   }
 
-  return { buildings, rooms, errors, validData };
+  return { buildings, rooms, errors, failedRows, validData };
 };
 
 router.get('/', (_req: Request, res: Response) => {
@@ -301,7 +325,9 @@ router.post('/preview', (req: Request, res: Response) => {
     buildings: result.buildings,
     rooms: result.rooms,
     errors: result.errors,
+    failedRows: result.failedRows,
     validData: result.validData,
+    rawData: data,
     filename: filename || 'import.xlsx',
     createdAt: new Date().toISOString(),
   };
@@ -312,12 +338,16 @@ router.post('/preview', (req: Request, res: Response) => {
     delete db.previewCache[previewId];
   }, 30 * 60 * 1000);
 
+  const totalBeds = result.rooms.reduce((sum, r) => sum + r.capacity, 0);
+
   res.json({
     previewId,
     buildings: result.buildings,
     rooms: result.rooms,
     errors: result.errors,
+    failedRows: result.failedRows,
     totalNew: result.rooms.length,
+    totalBeds,
   });
 });
 
@@ -334,9 +364,13 @@ router.post('/confirm', (req: Request, res: Response) => {
   let successCount = 0;
   let failedCount = preview.errors.length;
   const errors = [...preview.errors];
+  const failedRows = [...preview.failedRows];
   const rollbackIds: RollbackIds = { buildingIds: [], roomIds: [], bedIds: [] };
   const buildingCache: Record<string, string> = {};
-  const createdBuildingNames = new Set<string>();
+  const createdBuildings: CreatedBuilding[] = [];
+  const createdRooms: CreatedRoom[] = [];
+  const createdBeds: CreatedBed[] = [];
+  const createdBuildingSet = new Set<string>();
 
   for (let i = 0; i < data.length; i++) {
     const row = data[i];
@@ -365,35 +399,49 @@ router.post('/confirm', (req: Request, res: Response) => {
         }
       } else {
         buildingId = uuidv4();
-        db.buildings.push({
+        const newBuilding = {
           id: buildingId,
           name: buildingName,
           gender,
           floors,
           totalRooms: 0,
           createdAt: new Date().toISOString(),
-        });
+        };
+        db.buildings.push(newBuilding);
         buildingCache[buildingName] = buildingId;
-        createdBuildingNames.add(buildingId);
+        createdBuildingSet.add(buildingId);
         rollbackIds.buildingIds.push(buildingId);
+        createdBuildings.push({
+          id: buildingId,
+          name: buildingName,
+          gender,
+          floors,
+          totalRooms: 0,
+        });
       }
     }
 
     const building = db.buildings.find(b => b.id === buildingId)!;
     if (building.gender !== gender) {
-      errors.push({ row: rowNum, message: `楼栋"${buildingName}"性别不一致` });
+      const msg = `楼栋"${buildingName}"性别不一致`;
+      errors.push({ row: rowNum, message: msg });
+      failedRows.push({ row: rowNum, data: { ...row }, message: msg });
       failedCount++;
       continue;
     }
 
     if (floor > building.floors) {
-      errors.push({ row: rowNum, message: `楼层${floor}超出楼栋"${buildingName}"的总楼层数${building.floors}` });
+      const msg = `楼层${floor}超出楼栋"${buildingName}"的总楼层数${building.floors}`;
+      errors.push({ row: rowNum, message: msg });
+      failedRows.push({ row: rowNum, data: { ...row }, message: msg });
       continue;
     }
 
     const existingRoom = db.rooms.find(r => r.buildingId === buildingId && r.roomNumber === roomNumber);
     if (existingRoom) {
-      errors.push({ row: rowNum, message: `房间号${roomNumber}在楼栋"${buildingName}"中已存在` });
+      const msg = `房间号${roomNumber}在楼栋"${buildingName}"中已存在`;
+      errors.push({ row: rowNum, message: msg });
+      failedRows.push({ row: rowNum, data: { ...row }, message: msg });
       failedCount++;
       continue;
     }
@@ -410,6 +458,7 @@ router.post('/confirm', (req: Request, res: Response) => {
     });
     rollbackIds.roomIds.push(rId);
 
+    const bedIdsForRoom: string[] = [];
     for (let b = 1; b <= capacity; b++) {
       const bedId = uuidv4();
       db.beds.push({
@@ -421,7 +470,24 @@ router.post('/confirm', (req: Request, res: Response) => {
         createdAt: new Date().toISOString(),
       });
       rollbackIds.bedIds.push(bedId);
+      bedIdsForRoom.push(bedId);
+      createdBeds.push({
+        id: bedId,
+        roomNumber,
+        bedNumber: b,
+        buildingName,
+      });
     }
+
+    createdRooms.push({
+      id: rId,
+      buildingName,
+      floor,
+      roomNumber,
+      dormitoryType,
+      capacity,
+      bedCount: capacity,
+    });
 
     successCount++;
   }
@@ -430,6 +496,10 @@ router.post('/confirm', (req: Request, res: Response) => {
     const building = db.buildings.find(b => b.id === bid);
     if (building) {
       building.totalRooms = db.rooms.filter(r => r.buildingId === bid).length;
+      const cb = createdBuildings.find(b => b.id === bid);
+      if (cb) {
+        cb.totalRooms = building.totalRooms;
+      }
     }
   }
 
@@ -438,12 +508,16 @@ router.post('/confirm', (req: Request, res: Response) => {
     id: historyId,
     createdAt: new Date().toISOString(),
     operator: '系统',
-    filename: preview.filename,
+    fileName: preview.filename,
     successCount,
     failedCount,
     rollbackIds,
     errors,
     status: 'confirmed',
+    createdBuildings,
+    createdRooms,
+    createdBeds,
+    failedRows,
   });
 
   db.operationLogs.push({
@@ -464,15 +538,137 @@ router.post('/confirm', (req: Request, res: Response) => {
     failedCount,
     errors,
     rollbackIds,
+    createdBuildings,
+    createdRooms,
+    createdBeds,
+    failedRows,
   });
 });
 
 router.get('/import-history', (_req: Request, res: Response) => {
   const list = db.importHistories.map(h => ({
-    ...h,
+    id: h.id,
+    createdAt: h.createdAt,
+    operator: h.operator,
+    fileName: h.fileName,
+    successCount: h.successCount,
+    failedCount: h.failedCount,
+    rollbackIds: h.rollbackIds,
+    errors: h.errors,
+    status: h.status,
     canRollback: h.status === 'confirmed',
   }));
   res.json(list);
+});
+
+router.get('/import-history/:id', (req: Request, res: Response) => {
+  const history = db.importHistories.find(h => h.id === req.params.id);
+  if (!history) {
+    res.status(404).json({ error: '导入记录不存在' });
+    return;
+  }
+
+  const buildingDetail = history.createdBuildings.map(b => {
+    const realBuilding = db.buildings.find(bb => bb.id === b.id);
+    return {
+      ...b,
+      exists: !!realBuilding,
+    };
+  });
+
+  const roomDetail = history.createdRooms.map(r => {
+    const realRoom = db.rooms.find(rr => rr.id === r.id);
+    return {
+      ...r,
+      exists: !!realRoom,
+    };
+  });
+
+  const bedDetail = history.createdBeds.map(b => {
+    const realBed = db.beds.find(bb => bb.id === b.id);
+    return {
+      ...b,
+      exists: !!realBed,
+      status: realBed?.status || null,
+    };
+  });
+
+  res.json({
+    ...history,
+    buildings: buildingDetail,
+    rooms: roomDetail,
+    beds: bedDetail,
+  });
+});
+
+const checkRollbackAvailability = (history: ImportHistory) => {
+  if (history.status === 'rolledback') {
+    return { canRollback: false, reason: '该导入记录已被撤回' };
+  }
+
+  const { roomIds, bedIds } = history.rollbackIds;
+  const occupiedBeds = db.beds.filter(bed =>
+    bedIds.includes(bed.id) && bed.status === 'occupied'
+  );
+
+  if (occupiedBeds.length > 0) {
+    const occupiedBedList = occupiedBeds.map(bed => {
+      const room = db.rooms.find(r => r.id === bed.roomId);
+      const building = db.buildings.find(b => b.id === room?.buildingId);
+      return {
+        id: bed.id,
+        bedNumber: bed.bedNumber,
+        roomNumber: room?.roomNumber || '',
+        buildingName: building?.name || '',
+      };
+    });
+    return {
+      canRollback: false,
+      reason: `撤回失败：${occupiedBeds.length}个床位已被入住，无法撤回`,
+      occupiedCount: occupiedBeds.length,
+      occupiedBeds: occupiedBedList,
+    };
+  }
+
+  return { canRollback: true };
+};
+
+router.get('/import-history/:id/rollback-preview', (req: Request, res: Response) => {
+  const history = db.importHistories.find(h => h.id === req.params.id);
+  if (!history) {
+    res.status(404).json({ error: '导入记录不存在' });
+    return;
+  }
+
+  const checkResult = checkRollbackAvailability(history);
+
+  const buildingNames = history.createdBuildings.map(b => b.name);
+  const roomList = history.createdRooms.map(r => ({
+    buildingName: r.buildingName,
+    floor: r.floor,
+    roomNumber: r.roomNumber,
+  }));
+  const bedList = history.createdBeds.map(b => ({
+    buildingName: b.buildingName,
+    roomNumber: b.roomNumber,
+    bedNumber: b.bedNumber,
+  }));
+
+  res.json({
+    canRollback: checkResult.canRollback,
+    reason: checkResult.reason || null,
+    occupiedCount: (checkResult as any).occupiedCount || 0,
+    occupiedBeds: (checkResult as any).occupiedBeds || [],
+    buildingCount: history.createdBuildings.length,
+    roomCount: history.createdRooms.length,
+    bedCount: history.createdBeds.length,
+    buildingNames,
+    rooms: roomList,
+    beds: bedList,
+    riskWarning: checkResult.canRollback
+      ? '撤回操作将删除上述所有楼栋、房间和床位，请确认是否继续？'
+      : checkResult.reason,
+  });
 });
 
 router.post('/import-history/:id/rollback', (req: Request, res: Response) => {
@@ -482,25 +678,17 @@ router.post('/import-history/:id/rollback', (req: Request, res: Response) => {
     return;
   }
 
-  if (history.status === 'rolledback') {
-    res.status(400).json({ error: '该导入记录已被撤回' });
-    return;
-  }
-
-  const { roomIds } = history.rollbackIds;
-  const occupiedBeds = db.beds.filter(bed =>
-    roomIds.includes(bed.roomId) && bed.status === 'occupied'
-  );
-
-  if (occupiedBeds.length > 0) {
+  const checkResult = checkRollbackAvailability(history);
+  if (!checkResult.canRollback) {
     res.status(400).json({
-      error: '撤回失败：部分床位已被入住，无法撤回',
-      occupiedCount: occupiedBeds.length,
+      error: checkResult.reason,
+      occupiedCount: (checkResult as any).occupiedCount || 0,
+      occupiedBeds: (checkResult as any).occupiedBeds || [],
     });
     return;
   }
 
-  const { bedIds, buildingIds } = history.rollbackIds;
+  const { bedIds, roomIds, buildingIds } = history.rollbackIds;
 
   for (const bedId of bedIds) {
     const idx = db.beds.findIndex(b => b.id === bedId);
@@ -533,7 +721,7 @@ router.post('/import-history/:id/rollback', (req: Request, res: Response) => {
     employeeName: '系统',
     operationType: 'import',
     roomNumber: '',
-    description: `撤回导入记录: ${history.filename}`,
+    description: `撤回导入记录: ${history.fileName}`,
     createdAt: new Date().toISOString(),
   });
 
