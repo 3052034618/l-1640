@@ -74,6 +74,8 @@ export interface Checkout {
   sharePerPerson: number | null
   completedAt: string | null
   createdAt: string
+  previousWaterReading?: number
+  previousElectricReading?: number
   application?: Application
 }
 

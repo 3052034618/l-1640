@@ -1,27 +1,48 @@
 import { useEffect, useState } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
-import { ArrowLeft, Check, X, Printer, Download } from 'lucide-react'
-import type { Application, Bed } from '@/types'
+import { ArrowLeft, Check, X, Printer, Download, Users, Star, ChevronRight } from 'lucide-react'
+import type { Application } from '@/types'
 import { formatStatus, statusBadgeClass } from '@/lib/helpers'
 
 const GENDER_MAP: Record<string, string> = { male: '男', female: '女' }
 const DORM_TYPE_MAP: Record<string, string> = { single: '单人间', double: '双人间', quad: '四人间' }
+const PRIORITY_LABEL: Record<string, { text: string; color: string }> = {
+  high: { text: '推荐', color: 'bg-emerald-100 text-emerald-800' },
+  medium: { text: '一般', color: 'bg-blue-100 text-blue-800' },
+  low: { text: '不推荐', color: 'bg-gray-100 text-gray-600' },
+}
+
+interface MatchedBed {
+  id: string
+  bedNumber: number
+  roomNumber: string
+  buildingName: string
+  buildingId: string
+  floor: number
+  dormitoryType: string
+  roomOccupants: number
+  roomCapacity: number
+  occupantDepartments: string[]
+  priority: 'high' | 'medium' | 'low'
+  priorityReason: string
+}
 
 export default function CheckinDetail() {
   const { id } = useParams<{ id: string }>()
   const navigate = useNavigate()
   const [app, setApp] = useState<Application | null>(null)
-  const [beds, setBeds] = useState<any[]>([])
+  const [beds, setBeds] = useState<MatchedBed[]>([])
   const [selectedBed, setSelectedBed] = useState('')
   const [rejectReason, setRejectReason] = useState('')
   const [showReject, setShowReject] = useState(false)
   const [loading, setLoading] = useState(true)
   const [submitting, setSubmitting] = useState(false)
+  const [activePriority, setActivePriority] = useState<string>('all')
 
   useEffect(() => {
     Promise.all([
       fetch(`/api/applications/${id}`).then(r => r.json()) as Promise<Application>,
-      fetch(`/api/applications/${id}/match-beds`).then(r => r.json()) as Promise<{ beds: Bed[] }>,
+      fetch(`/api/applications/${id}/match-beds`).then(r => r.json()) as Promise<{ beds: MatchedBed[]; department: string }>,
     ]).then(([appData, bedData]) => {
       setApp(appData)
       setBeds(bedData.beds || [])
@@ -62,8 +83,6 @@ export default function CheckinDetail() {
   const handlePrint = () => window.print()
 
   const handleDownloadPDF = () => {
-    const content = document.getElementById('notice-card')
-    if (!content) return
     import('jspdf').then(({ default: jsPDF }) => {
       const doc = new jsPDF()
       doc.setFont('helvetica')
@@ -72,14 +91,21 @@ export default function CheckinDetail() {
       doc.setFontSize(12)
       const lines = [
         `Employee: ${app?.employee?.name || '-'}`,
-        `Room: ${app?.bed?.room?.roomNumber || '-'}`,
-        `Bed: ${app?.bed?.bedNumber || '-'}`,
+        `Room: ${(app as any)?.bed?.room?.roomNumber || '-'}`,
+        `Bed: ${(app as any)?.bed?.bedNumber || '-'}`,
         `Start: ${app?.startDate || '-'}`,
         `End: ${app?.endDate || '-'}`,
       ]
       lines.forEach((line, i) => doc.text(line, 20, 35 + i * 8))
       doc.save(`checkin-notice-${id}.pdf`)
     })
+  }
+
+  const filteredBeds = activePriority === 'all' ? beds : beds.filter(b => b.priority === activePriority)
+  const groupedBeds = {
+    high: beds.filter(b => b.priority === 'high'),
+    medium: beds.filter(b => b.priority === 'medium'),
+    low: beds.filter(b => b.priority === 'low'),
   }
 
   if (loading) return <div className="p-6 space-y-4"><div className="card p-6 h-64 animate-pulse" /></div>
@@ -108,26 +134,68 @@ export default function CheckinDetail() {
 
       {app.status === 'pending' && (
         <div className="card p-6">
-          <h3 className="text-lg font-bold text-gray-900 mb-4">推荐床位</h3>
-          {beds.length === 0 ? (
-            <p className="text-sm text-gray-400">暂无推荐床位</p>
+          <div className="flex items-center justify-between mb-4">
+            <h3 className="text-lg font-bold text-gray-900">推荐床位</h3>
+            <div className="flex items-center gap-1 text-sm text-gray-500">
+              <Users className="w-4 h-4" />
+              <span>按部门规则排序（{app.department}优先同部门房间）</span>
+            </div>
+          </div>
+
+          <div className="flex gap-2 mb-4">
+            {[
+              { key: 'all', label: `全部 (${beds.length})` },
+              { key: 'high', label: `推荐 (${groupedBeds.high.length})` },
+              { key: 'medium', label: `一般 (${groupedBeds.medium.length})` },
+              { key: 'low', label: `不推荐 (${groupedBeds.low.length})` },
+            ].map(tab => (
+              <button key={tab.key}
+                className={`px-3 py-1.5 rounded-lg text-xs font-medium transition-colors ${activePriority === tab.key ? 'bg-[#1E3A5F] text-white' : 'bg-gray-100 text-gray-600 hover:bg-gray-200'}`}
+                onClick={() => setActivePriority(tab.key)}>
+                {tab.label}
+              </button>
+            ))}
+          </div>
+
+          {filteredBeds.length === 0 ? (
+            <p className="text-sm text-gray-400 py-4 text-center">暂无匹配床位</p>
           ) : (
-            <div className="grid grid-cols-2 gap-3 mb-4">
-              {beds.map(bed => (
-                <label key={bed.id}
-                  className={`p-4 rounded-lg border-2 cursor-pointer transition-colors ${selectedBed === bed.id ? 'border-[#1E3A5F] bg-blue-50' : 'border-gray-200 hover:border-gray-300'}`}
-                  onClick={() => setSelectedBed(bed.id)}>
-                  <div className="flex items-center gap-2">
-                    <input type="radio" name="bed" checked={selectedBed === bed.id} onChange={() => setSelectedBed(bed.id)} className="accent-[#1E3A5F]" />
-                    <span className="font-medium text-sm">{bed.buildingName} {bed.roomNumber} - {bed.bedNumber}号床</span>
-                  </div>
-                  <div className="text-xs text-gray-500 mt-1 ml-5">
-                    楼层: {bed.floor}F | 房型: {DORM_TYPE_MAP[bed.dormitoryType] || bed.dormitoryType}
-                  </div>
-                </label>
-              ))}
+            <div className="space-y-3 mb-4">
+              {filteredBeds.map(bed => {
+                const pl = PRIORITY_LABEL[bed.priority]
+                return (
+                  <label key={bed.id}
+                    className={`block p-4 rounded-lg border-2 cursor-pointer transition-colors ${selectedBed === bed.id ? 'border-[#1E3A5F] bg-blue-50' : 'border-gray-200 hover:border-gray-300'}`}
+                    onClick={() => setSelectedBed(bed.id)}>
+                    <div className="flex items-center gap-3">
+                      <input type="radio" name="bed" checked={selectedBed === bed.id} onChange={() => setSelectedBed(bed.id)} className="accent-[#1E3A5F]" />
+                      <span className="font-medium text-sm">{bed.buildingName} {bed.roomNumber} - {bed.bedNumber}号床</span>
+                      <span className={`px-2 py-0.5 rounded-full text-xs font-medium ${pl.color}`}>{pl.text}</span>
+                      <ChevronRight className="w-4 h-4 text-gray-300 ml-auto" />
+                    </div>
+                    <div className="flex items-center gap-4 text-xs text-gray-500 mt-2 ml-6">
+                      <span>楼层: {bed.floor}F</span>
+                      <span>房型: {DORM_TYPE_MAP[bed.dormitoryType] || bed.dormitoryType}</span>
+                      <span>入住: {bed.roomOccupants}/{bed.roomCapacity}</span>
+                      {bed.occupantDepartments.length > 0 && (
+                        <span className="flex items-center gap-1">
+                          <Users className="w-3 h-3" />
+                          {bed.occupantDepartments.join('、')}
+                        </span>
+                      )}
+                    </div>
+                    <div className="text-xs mt-1 ml-6 flex items-center gap-1">
+                      {bed.priority === 'high' && <Star className="w-3 h-3 text-emerald-500 fill-emerald-500" />}
+                      <span className={bed.priority === 'high' ? 'text-emerald-600 font-medium' : bed.priority === 'low' ? 'text-gray-400' : 'text-gray-500'}>
+                        {bed.priorityReason}
+                      </span>
+                    </div>
+                  </label>
+                )
+              })}
             </div>
           )}
+
           <div className="flex gap-3">
             <button className="btn-primary flex items-center gap-1" disabled={submitting || !selectedBed} onClick={handleApprove}>
               <Check className="w-4 h-4" /> 确认分配
@@ -162,8 +230,8 @@ export default function CheckinDetail() {
               <p>尊敬的 <strong>{app.employee?.name}</strong> 先生/女士：</p>
               <p>您已成功申请宿舍，现将入住信息通知如下：</p>
               <div className="bg-white/10 rounded-lg p-4 space-y-1 my-3">
-                <p>房间号：{app.bed?.room?.roomNumber || '-'}</p>
-                <p>床位号：{app.bed?.bedNumber || '-'}</p>
+                <p>房间号：{(app as any)?.bed?.room?.roomNumber || '-'}</p>
+                <p>床位号：{(app as any)?.bed?.bedNumber || '-'}</p>
                 <p>入住日期：{app.startDate || '-'}</p>
                 <p>到期日期：{app.endDate || '-'}</p>
               </div>

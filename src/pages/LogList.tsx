@@ -7,8 +7,10 @@ const TYPE_OPTIONS = [
   { value: '', label: '全部' },
   { value: 'checkin', label: '入住' },
   { value: 'checkout', label: '退宿' },
-  { value: 'assign', label: '分配' },
+  { value: 'inspection', label: '检查' },
+  { value: 'import', label: '导入' },
   { value: 'warning', label: '预警' },
+  { value: 'other', label: '其他' },
 ]
 
 export default function LogList() {
@@ -61,12 +63,12 @@ export default function LogList() {
   const totalPages = Math.ceil(total / pageSize)
 
   const typeLabel = (t: string) => {
-    const map: Record<string, string> = { checkin: '入住', checkout: '退宿', assign: '分配', warning: '预警' }
+    const map: Record<string, string> = { checkin: '入住', checkout: '退宿', inspection: '检查', import: '导入', warning: '预警', other: '其他' }
     return map[t] || t
   }
 
   const typeColor = (t: string) => {
-    const map: Record<string, string> = { checkin: 'badge-success', checkout: 'badge-danger', assign: 'badge-info', warning: 'badge-warning' }
+    const map: Record<string, string> = { checkin: 'badge-success', checkout: 'badge-danger', inspection: 'badge-info', import: 'badge-info', warning: 'badge-warning', other: 'badge-pending' }
     return map[t] || 'badge-info'
   }
 

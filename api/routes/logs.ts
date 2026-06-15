@@ -4,34 +4,51 @@ import db from '../db.js';
 
 const router = Router();
 
-router.get('/', (req: Request, res: Response) => {
-  const { employeeName, roomNumber, startDate, endDate, operationType, page = '1', pageSize = '10' } = req.query;
+const TYPE_LABELS: Record<string, string> = {
+  checkin: '入住',
+  checkout: '退宿',
+  inspection: '检查',
+  import: '导入',
+  warning: '预警',
+  other: '其他',
+};
+
+function filterLogs(query: Record<string, unknown>) {
   let list = [...db.operationLogs];
 
-  if (employeeName) {
-    const kw = String(employeeName).toLowerCase();
+  if (query.employeeName) {
+    const kw = String(query.employeeName).toLowerCase();
     list = list.filter(l => l.employeeName.toLowerCase().includes(kw));
   }
 
-  if (roomNumber) {
-    list = list.filter(l => l.roomNumber === String(roomNumber));
+  if (query.roomNumber) {
+    const rn = String(query.roomNumber);
+    list = list.filter(l => l.roomNumber.includes(rn));
   }
 
-  if (startDate) {
-    const s = new Date(String(startDate));
+  if (query.startDate) {
+    const s = new Date(String(query.startDate));
     list = list.filter(l => new Date(l.createdAt) >= s);
   }
 
-  if (endDate) {
-    const e = new Date(String(endDate));
+  if (query.endDate) {
+    const e = new Date(String(query.endDate));
+    e.setHours(23, 59, 59, 999);
     list = list.filter(l => new Date(l.createdAt) <= e);
   }
 
-  if (operationType) {
-    list = list.filter(l => l.operationType === String(operationType));
+  if (query.operationType) {
+    list = list.filter(l => l.operationType === String(query.operationType));
   }
 
   list.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+
+  return list;
+}
+
+router.get('/', (req: Request, res: Response) => {
+  const { page = '1', pageSize = '10' } = req.query;
+  const list = filterLogs(req.query as Record<string, unknown>);
 
   const p = Number(page);
   const ps = Number(pageSize);
@@ -43,43 +60,26 @@ router.get('/', (req: Request, res: Response) => {
 });
 
 router.get('/export', (req: Request, res: Response) => {
-  const { employeeName, roomNumber, startDate, endDate, operationType } = req.query;
-  let list = [...db.operationLogs];
-
-  if (employeeName) {
-    const kw = String(employeeName).toLowerCase();
-    list = list.filter(l => l.employeeName.toLowerCase().includes(kw));
-  }
-
-  if (roomNumber) {
-    list = list.filter(l => l.roomNumber === String(roomNumber));
-  }
-
-  if (startDate) {
-    const s = new Date(String(startDate));
-    list = list.filter(l => new Date(l.createdAt) >= s);
-  }
-
-  if (endDate) {
-    const e = new Date(String(endDate));
-    list = list.filter(l => new Date(l.createdAt) <= e);
-  }
-
-  if (operationType) {
-    list = list.filter(l => l.operationType === String(operationType));
-  }
+  const list = filterLogs(req.query as Record<string, unknown>);
 
   const rows = list.map(l => ({
-    EmployeeName: l.employeeName,
-    OperationType: l.operationType,
-    RoomNumber: l.roomNumber,
-    Description: l.description,
-    CreatedAt: l.createdAt,
+    '时间': new Date(l.createdAt).toLocaleString('zh-CN'),
+    '操作人': l.employeeName,
+    '操作类型': TYPE_LABELS[l.operationType] || l.operationType,
+    '房间编号': l.roomNumber,
+    '描述': l.description,
   }));
 
   const wb = XLSX.utils.book_new();
   const ws = XLSX.utils.json_to_sheet(rows);
-  XLSX.utils.book_append_sheet(wb, ws, 'OperationLogs');
+  ws['!cols'] = [
+    { wch: 20 },
+    { wch: 12 },
+    { wch: 10 },
+    { wch: 12 },
+    { wch: 40 },
+  ];
+  XLSX.utils.book_append_sheet(wb, ws, '操作日志');
 
   const buffer = XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' });
   res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');

@@ -83,10 +83,52 @@ router.get('/:id/match-beds', (req: Request, res: Response) => {
   const enrichedBeds = matchingBeds.map(bed => {
     const room = db.rooms.find(r => r.id === bed.roomId)!;
     const building = db.buildings.find(b => b.id === room.buildingId)!;
-    return { ...bed, roomNumber: room.roomNumber, buildingName: building.name, floor: room.floor, dormitoryType: room.dormitoryType };
+
+    const roomBeds = db.beds.filter(b => b.roomId === room.id);
+    const occupiedBeds = roomBeds.filter(b => b.status === 'occupied' && b.currentOccupantId);
+    const occupantDepartments: string[] = [];
+    for (const ob of occupiedBeds) {
+      const occupantApp = db.applications.find(a => a.employeeId === ob.currentOccupantId && a.status === 'assigned');
+      if (occupantApp) occupantDepartments.push(occupantApp.department);
+    }
+
+    const sameDeptCount = occupantDepartments.filter(d => d === app.department).length;
+    const diffDeptCount = occupantDepartments.filter(d => d !== app.department).length;
+
+    let priority: 'high' | 'medium' | 'low' = 'medium';
+    let priorityReason = '';
+    if (sameDeptCount > 0) {
+      priority = 'high';
+      priorityReason = `房间已有${sameDeptCount}位${app.department}同事`;
+    } else if (diffDeptCount > 0) {
+      priority = 'low';
+      priorityReason = `房间已有${diffDeptCount}位其他部门同事`;
+    } else {
+      priority = 'medium';
+      priorityReason = '空闲房间，无部门偏好';
+    }
+
+    return {
+      ...bed,
+      roomNumber: room.roomNumber,
+      buildingName: building.name,
+      buildingId: building.id,
+      floor: room.floor,
+      dormitoryType: room.dormitoryType,
+      roomOccupants: occupiedBeds.length,
+      roomCapacity: room.capacity,
+      occupantDepartments: [...new Set(occupantDepartments)],
+      priority,
+      priorityReason,
+    };
   });
 
-  res.json({ beds: enrichedBeds });
+  const sorted = enrichedBeds.sort((a, b) => {
+    const priorityOrder = { high: 0, medium: 1, low: 2 };
+    return priorityOrder[a.priority] - priorityOrder[b.priority];
+  });
+
+  res.json({ beds: sorted, department: app.department });
 });
 
 router.get('/:id', (req: Request, res: Response) => {

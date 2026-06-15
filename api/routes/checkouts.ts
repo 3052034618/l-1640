@@ -122,7 +122,13 @@ router.get('/:id', (req: Request, res: Response) => {
 });
 
 router.put('/:id/checklist', (req: Request, res: Response) => {
-  const { items } = req.body as { items: { id: string; status: 'pending' | 'pass' | 'fail'; remark?: string }[] };
+  const checkout = db.checkouts.find(c => c.id === req.params.id);
+  if (!checkout) {
+    res.status(404).json({ error: 'Checkout not found' });
+    return;
+  }
+
+  const { items, advance } = req.body as { items: { id: string; status: 'pending' | 'pass' | 'fail'; remark?: string }[]; advance?: boolean };
   for (const item of items) {
     const ci = db.checklistItems.find(c => c.id === item.id);
     if (ci) {
@@ -130,7 +136,31 @@ router.put('/:id/checklist', (req: Request, res: Response) => {
       if (item.remark !== undefined) ci.remark = item.remark;
     }
   }
-  res.json({ success: true });
+
+  if (advance) {
+    if (checkout.status === 'inspection') {
+      checkout.status = 'confirming';
+    } else if (checkout.status === 'confirming') {
+      checkout.status = 'settling';
+    }
+
+    const app = db.applications.find(a => a.id === checkout.applicationId);
+    const emp = app ? db.employees.find(e => e.id === app.employeeId) : null;
+    const bed = app?.bedId ? db.beds.find(b => b.id === app.bedId) : null;
+    const room = bed ? db.rooms.find(r => r.id === bed.roomId) : null;
+
+    db.operationLogs.push({
+      id: uuidv4(),
+      employeeId: app?.employeeId || '',
+      employeeName: emp?.name || '',
+      operationType: 'inspection',
+      roomNumber: room?.roomNumber || '',
+      description: `${emp?.name || ''}退宿检查${checkout.status === 'confirming' ? '完成，待确认' : '已确认，进入结算'}`,
+      createdAt: new Date().toISOString(),
+    });
+  }
+
+  res.json(checkout);
 });
 
 router.put('/:id/settle', (req: Request, res: Response) => {
@@ -158,17 +188,28 @@ router.put('/:id/settle', (req: Request, res: Response) => {
   checkout.electricFee = Math.round(electricFee * 100) / 100;
   checkout.totalFee = Math.round(totalFee * 100) / 100;
   checkout.sharePerPerson = sharePerPerson;
-  checkout.status = 'settling';
+  checkout.status = 'completed';
+  checkout.completedAt = new Date().toISOString();
 
   const emp = app ? db.employees.find(e => e.id === app.employeeId) : null;
+
+  if (app?.bedId) {
+    const bedToUpdate = db.beds.find(b => b.id === app.bedId);
+    if (bedToUpdate) {
+      bedToUpdate.status = 'available';
+      bedToUpdate.currentOccupantId = null;
+    }
+  }
+
+  const roomForLog = bed ? db.rooms.find(r => r.id === bed.roomId) : null;
 
   db.operationLogs.push({
     id: uuidv4(),
     employeeId: app?.employeeId || '',
     employeeName: emp?.name || '',
     operationType: 'checkout',
-    roomNumber: room?.roomNumber || '',
-    description: `${emp?.name || ''}退房结算: 水费${checkout.waterFee}元, 电费${checkout.electricFee}元`,
+    roomNumber: roomForLog?.roomNumber || '',
+    description: `${emp?.name || ''}退房结算完成: 水费${checkout.waterFee}元, 电费${checkout.electricFee}元, 总计${checkout.totalFee}元, 已释放床位`,
     createdAt: new Date().toISOString(),
   });
 
@@ -179,6 +220,11 @@ router.put('/:id/complete', (req: Request, res: Response) => {
   const checkout = db.checkouts.find(c => c.id === req.params.id);
   if (!checkout) {
     res.status(404).json({ error: 'Checkout not found' });
+    return;
+  }
+
+  if (checkout.status === 'completed') {
+    res.json(checkout);
     return;
   }
 

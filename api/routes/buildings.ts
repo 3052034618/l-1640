@@ -44,40 +44,101 @@ router.get('/:id/rooms', (req: Request, res: Response) => {
 });
 
 router.post('/import', (req: Request, res: Response) => {
-  const { buildingId, rooms: roomDataList } = req.body as {
-    buildingId: string;
-    rooms: { floor: number; roomNumber: string; dormitoryType: 'single' | 'double' | 'quad' }[];
-  };
+  const { data } = req.body as { data: Record<string, unknown>[] };
 
-  const building = db.buildings.find(b => b.id === buildingId);
-  if (!building) {
-    res.status(404).json({ error: 'Building not found' });
+  if (!Array.isArray(data) || data.length === 0) {
+    res.status(400).json({ success: 0, failed: 0, errors: [{ row: 0, message: '导入数据为空' }] });
     return;
   }
 
-  const capacityMap: Record<string, number> = { single: 1, double: 2, quad: 4 };
+  const capacityMap: Record<string, number> = { single: 1, double: 2, quad: 4, 单人间: 1, 双人间: 2, 四人间: 4 };
+  const typeMap: Record<string, 'single' | 'double' | 'quad'> = { single: 'single', double: 'double', quad: 'quad', 单人间: 'single', 双人间: 'double', 四人间: 'quad' };
+  const genderMap: Record<string, 'male' | 'female'> = { male: 'male', female: 'female', 男: 'male', 女: 'female' };
+
+  const getVal = (row: Record<string, unknown>, keys: string[]): unknown => {
+    for (const k of keys) {
+      if (row[k] !== undefined && row[k] !== null && String(row[k]).trim() !== '') return row[k];
+    }
+    return undefined;
+  };
+
   let success = 0;
   let failed = 0;
-  const errors: { roomNumber: string; reason: string }[] = [];
+  const errors: { row: number; message: string }[] = [];
 
-  for (const rd of roomDataList) {
-    if (rd.floor < 1 || rd.floor > building.floors) {
+  const buildingCache: Record<string, string> = {};
+
+  for (let i = 0; i < data.length; i++) {
+    const row = data[i];
+    const rowNum = i + 2;
+
+    const buildingName = String(getVal(row, ['楼栋名称', '楼栋', 'buildingName', 'building']) || '').trim();
+    const genderRaw = String(getVal(row, ['性别', 'gender']) || '').trim();
+    const floorsRaw = getVal(row, ['楼层数', '楼层', 'floors']);
+    const floorRaw = getVal(row, ['楼层号', '所在楼层', 'floor']);
+    const roomNumber = String(getVal(row, ['房间号', '房号', 'roomNumber', 'room']) || '').trim();
+    const typeRaw = String(getVal(row, ['房型', '宿舍类型', 'dormitoryType', 'type']) || '').trim();
+
+    const rowErrors: string[] = [];
+
+    if (!buildingName) rowErrors.push('楼栋名称不能为空');
+    if (!genderRaw || !genderMap[genderRaw]) rowErrors.push(`性别"${genderRaw}"无效，应为男/女`);
+    if (!floorRaw) rowErrors.push('楼层号不能为空');
+    else if (Number(floorRaw) < 1) rowErrors.push('楼层号必须大于0');
+    if (!roomNumber) rowErrors.push('房间号不能为空');
+    if (!typeRaw || !typeMap[typeRaw]) rowErrors.push(`房型"${typeRaw}"无效，应为单人间/双人间/四人间`);
+
+    if (rowErrors.length > 0) {
       failed++;
-      errors.push({ roomNumber: rd.roomNumber, reason: `楼层${rd.floor}不存在` });
+      errors.push({ row: rowNum, message: rowErrors.join('；') });
       continue;
     }
 
-    const expected = capacityMap[rd.dormitoryType];
-    if (!expected) {
+    const gender = genderMap[genderRaw];
+    const dormitoryType = typeMap[typeRaw];
+    const capacity = capacityMap[typeRaw];
+    const floor = Number(floorRaw);
+    const floors = floorsRaw ? Number(floorsRaw) : floor;
+
+    let buildingId = buildingCache[buildingName];
+    if (!buildingId) {
+      const existing = db.buildings.find(b => b.name === buildingName);
+      if (existing) {
+        buildingId = existing.id;
+        if (floor > existing.floors) {
+          existing.floors = floor;
+        }
+      } else {
+        buildingId = uuidv4();
+        db.buildings.push({
+          id: buildingId,
+          name: buildingName,
+          gender,
+          floors,
+          totalRooms: 0,
+          createdAt: new Date().toISOString(),
+        });
+      }
+      buildingCache[buildingName] = buildingId;
+    }
+
+    const building = db.buildings.find(b => b.id === buildingId)!;
+    if (building.gender !== gender) {
       failed++;
-      errors.push({ roomNumber: rd.roomNumber, reason: `无效的房型${rd.dormitoryType}` });
+      errors.push({ row: rowNum, message: `楼栋"${buildingName}"性别为${building.gender === 'male' ? '男' : '女'}生，与当前行${genderRaw}生不一致` });
       continue;
     }
 
-    const existing = db.rooms.find(r => r.buildingId === buildingId && r.roomNumber === rd.roomNumber);
-    if (existing) {
+    if (floor > building.floors) {
       failed++;
-      errors.push({ roomNumber: rd.roomNumber, reason: '房间号已存在' });
+      errors.push({ row: rowNum, message: `楼层${floor}超出楼栋"${buildingName}"的总楼层数${building.floors}` });
+      continue;
+    }
+
+    const existingRoom = db.rooms.find(r => r.buildingId === buildingId && r.roomNumber === roomNumber);
+    if (existingRoom) {
+      failed++;
+      errors.push({ row: rowNum, message: `房间号${roomNumber}在楼栋"${buildingName}"中已存在` });
       continue;
     }
 
@@ -85,14 +146,14 @@ router.post('/import', (req: Request, res: Response) => {
     db.rooms.push({
       id: rId,
       buildingId,
-      floor: rd.floor,
-      roomNumber: rd.roomNumber,
-      dormitoryType: rd.dormitoryType,
-      capacity: expected,
+      floor,
+      roomNumber,
+      dormitoryType,
+      capacity,
       createdAt: new Date().toISOString(),
     });
 
-    for (let b = 1; b <= expected; b++) {
+    for (let b = 1; b <= capacity; b++) {
       db.beds.push({
         id: uuidv4(),
         roomId: rId,
@@ -106,7 +167,12 @@ router.post('/import', (req: Request, res: Response) => {
     success++;
   }
 
-  building.totalRooms = db.rooms.filter(r => r.buildingId === buildingId).length;
+  for (const bid of Object.values(buildingCache)) {
+    const building = db.buildings.find(b => b.id === bid);
+    if (building) {
+      building.totalRooms = db.rooms.filter(r => r.buildingId === bid).length;
+    }
+  }
 
   db.operationLogs.push({
     id: uuidv4(),
@@ -114,7 +180,7 @@ router.post('/import', (req: Request, res: Response) => {
     employeeName: '系统',
     operationType: 'import',
     roomNumber: '',
-    description: `批量导入${building.name}房间: 成功${success}, 失败${failed}`,
+    description: `批量导入宿舍数据: 成功${success}, 失败${failed}`,
     createdAt: new Date().toISOString(),
   });
 
