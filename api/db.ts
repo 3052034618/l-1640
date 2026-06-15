@@ -52,7 +52,15 @@ export interface Application {
   rejectedReason: string | null;
   startDate: string | null;
   endDate: string | null;
+  assignReason: string | null;
   createdAt: string;
+}
+
+export interface DamageItem {
+  id: string;
+  name: string;
+  amount: number;
+  remark: string;
 }
 
 export interface Checkout {
@@ -70,6 +78,13 @@ export interface Checkout {
   createdAt: string;
   previousWaterReading: number;
   previousElectricReading: number;
+  facilityDamages: DamageItem[];
+  deposit: number;
+  depositDeducted: number;
+  finalFee: number;
+  paymentStatus: 'unpaid' | 'paid';
+  invoiceNumber: string | null;
+  billedAt: string | null;
 }
 
 export interface ChecklistItem {
@@ -100,6 +115,74 @@ export interface OperationLog {
   createdAt: string;
 }
 
+export interface RollbackIds {
+  buildingIds: string[];
+  roomIds: string[];
+  bedIds: string[];
+}
+
+export interface ImportHistory {
+  id: string;
+  createdAt: string;
+  operator: string;
+  filename: string;
+  successCount: number;
+  failedCount: number;
+  rollbackIds: RollbackIds;
+  errors: { row: number; message: string }[];
+  status: 'confirmed' | 'rolledback';
+}
+
+export interface PreviewBuildItem {
+  name: string;
+  gender: 'male' | 'female';
+  floors: number;
+}
+
+export interface PreviewRoomItem {
+  buildingName: string;
+  floor: number;
+  roomNumber: string;
+  dormitoryType: 'single' | 'double' | 'quad';
+  capacity: number;
+}
+
+export interface PreviewData {
+  previewId: string;
+  buildings: PreviewBuildItem[];
+  rooms: PreviewRoomItem[];
+  errors: { row: number; message: string }[];
+  validData: Record<string, unknown>[];
+  filename: string;
+  createdAt: string;
+}
+
+export interface DepartmentPriority {
+  id: string;
+  department: string;
+  priority: number;
+}
+
+export interface BuildingPreference {
+  id: string;
+  department: string;
+  buildingId: string;
+  priority: number;
+}
+
+export interface ForbiddenRule {
+  id: string;
+  department: string;
+  buildingId: string;
+  reason: string;
+}
+
+export interface AssignmentRule {
+  departmentPriorities: DepartmentPriority[];
+  buildingPreferences: BuildingPreference[];
+  forbiddenRules: ForbiddenRule[];
+}
+
 const buildings: Building[] = [];
 const rooms: Room[] = [];
 const beds: Bed[] = [];
@@ -109,6 +192,11 @@ const checkouts: Checkout[] = [];
 const checklistItems: ChecklistItem[] = [];
 const warnings: Warning[] = [];
 const operationLogs: OperationLog[] = [];
+const importHistories: ImportHistory[] = [];
+const previewCache: Record<string, PreviewData> = {};
+const departmentPriorities: DepartmentPriority[] = [];
+const buildingPreferences: BuildingPreference[] = [];
+const forbiddenRules: ForbiddenRule[] = [];
 
 function now(): string {
   return new Date().toISOString();
@@ -238,9 +326,26 @@ function seedData() {
       rejectedReason,
       startDate,
       endDate,
+      assignReason: null,
       createdAt: now(),
     });
   }
+
+  departmentPriorities.push(
+    { id: uuidv4(), department: '技术部', priority: 10 },
+    { id: uuidv4(), department: '市场部', priority: 7 },
+    { id: uuidv4(), department: '财务部', priority: 5 },
+    { id: uuidv4(), department: '行政部', priority: 3 },
+  );
+
+  buildingPreferences.push(
+    { id: uuidv4(), department: '技术部', buildingId: b1Id, priority: 9 },
+    { id: uuidv4(), department: '市场部', buildingId: b2Id, priority: 8 },
+  );
+
+  forbiddenRules.push(
+    { id: uuidv4(), department: '财务部', buildingId: b1Id, reason: '1号楼为技术部专属楼栋' },
+  );
 
   const coId = uuidv4();
   checkouts.push({
@@ -258,6 +363,13 @@ function seedData() {
     createdAt: now(),
     previousWaterReading: 100,
     previousElectricReading: 200,
+    facilityDamages: [],
+    deposit: 500,
+    depositDeducted: 0,
+    finalFee: 0,
+    paymentStatus: 'unpaid',
+    invoiceNumber: null,
+    billedAt: null,
   });
 
   const checklistNames = ['家具完好', '电器正常', '墙面整洁', '门窗完好', '卫生间设施', '空调设备', '热水器', '网络设施'];
@@ -350,6 +462,11 @@ const db = {
   checklistItems,
   warnings,
   operationLogs,
+  importHistories,
+  previewCache,
+  departmentPriorities,
+  buildingPreferences,
+  forbiddenRules,
 };
 
 export default db;

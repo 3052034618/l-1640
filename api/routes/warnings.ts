@@ -137,6 +137,13 @@ router.put('/:id/handle', (req: Request, res: Response) => {
         createdAt: now.toISOString(),
         previousWaterReading: 100,
         previousElectricReading: 200,
+        facilityDamages: [],
+        deposit: 500,
+        depositDeducted: 0,
+        finalFee: 0,
+        paymentStatus: 'unpaid',
+        invoiceNumber: null,
+        billedAt: null,
       });
 
       const checklistNames = ['家具完好', '电器正常', '墙面整洁', '门窗完好', '卫生间设施', '空调设备', '热水器', '网络设施'];

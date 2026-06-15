@@ -56,9 +56,17 @@ export interface Application {
   rejectedReason: string | null
   startDate: string | null
   endDate: string | null
+  assignReason: string | null
   createdAt: string
   employee?: Employee
   bed?: Bed
+}
+
+export interface DamageItem {
+  id: string
+  name: string
+  amount: number
+  remark: string
 }
 
 export interface Checkout {
@@ -76,7 +84,16 @@ export interface Checkout {
   createdAt: string
   previousWaterReading?: number
   previousElectricReading?: number
+  facilityDamages?: DamageItem[]
+  deposit?: number
+  depositDeducted?: number
+  finalFee?: number
+  paymentStatus?: 'unpaid' | 'paid'
+  invoiceNumber?: string | null
+  billedAt?: string | null
   application?: Application
+  employeeName?: string
+  roomNumber?: string
 }
 
 export interface ChecklistItem {
@@ -130,4 +147,113 @@ export interface RecentActivity {
 export interface PaginatedResult<T> {
   total: number
   list: T[]
+}
+
+export interface RollbackIds {
+  buildingIds: string[]
+  roomIds: string[]
+  bedIds: string[]
+}
+
+export interface ImportError {
+  row: number
+  message: string
+}
+
+export interface ImportHistory {
+  id: string
+  createdAt: string
+  operator: string
+  filename: string
+  successCount: number
+  failedCount: number
+  rollbackIds: RollbackIds
+  errors: ImportError[]
+  status: 'confirmed' | 'rolledback'
+  canRollback?: boolean
+}
+
+export interface PreviewBuildItem {
+  name: string
+  gender: string
+  floors: number
+}
+
+export interface PreviewRoomItem {
+  buildingName: string
+  floor: number
+  roomNumber: string
+  dormitoryType: string
+  capacity: number
+}
+
+export interface PreviewResult {
+  previewId: string
+  buildings: PreviewBuildItem[]
+  rooms: PreviewRoomItem[]
+  errors: ImportError[]
+  totalNew: number
+}
+
+export interface ConfirmResult {
+  id: string
+  successCount: number
+  failedCount: number
+  errors: ImportError[]
+  rollbackIds: RollbackIds
+}
+
+export interface DepartmentPriority {
+  id: string
+  department: string
+  priority: number
+}
+
+export interface BuildingPreference {
+  id: string
+  department: string
+  buildingId: string
+  priority: number
+  buildingName?: string
+}
+
+export interface ForbiddenRule {
+  id: string
+  department: string
+  buildingId: string
+  reason: string
+  buildingName?: string
+}
+
+export interface AssignmentRuleData {
+  departmentPriorities: DepartmentPriority[]
+  buildingPreferences: BuildingPreference[]
+  forbiddenRules: ForbiddenRule[]
+  departments: string[]
+  buildings: Array<{ id: string; name: string; gender: string }>
+}
+
+export interface AutoAssignResult {
+  bed: {
+    id: string
+    bedNumber: number
+    roomNumber: string
+    buildingName: string
+    buildingId: string
+    floor: number
+    dormitoryType: string
+  }
+  assignReason: string
+  matchedBedsCount: number
+}
+
+export interface ForbiddenBuildingInfo {
+  buildingName: string
+  reason: string
+}
+
+export interface MatchBedsResult {
+  beds: any[]
+  department: string
+  forbiddenBuildings?: ForbiddenBuildingInfo[]
 }

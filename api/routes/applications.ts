@@ -4,6 +4,267 @@ import db from '../db.js';
 
 const router = Router();
 
+function getDepartments(): string[] {
+  const depts = new Set<string>();
+  for (const emp of db.employees) depts.add(emp.department);
+  return Array.from(depts);
+}
+
+function getRoomNumber(bedId: string): string {
+  const bed = db.beds.find(b => b.id === bedId);
+  if (!bed) return '';
+  const room = db.rooms.find(r => r.id === bed.roomId);
+  return room ? room.roomNumber : '';
+}
+
+function getBedWithInfo(bedId: string) {
+  const bed = db.beds.find(b => b.id === bedId);
+  if (!bed) return null;
+  const room = db.rooms.find(r => r.id === bed.roomId);
+  if (!room) return null;
+  const building = db.buildings.find(b => b.id === room.buildingId);
+  return { bed, room, building };
+}
+
+function enrichApplication(a: any) {
+  const emp = db.employees.find(e => e.id === a.employeeId);
+  const bed = a.bedId ? db.beds.find(b => b.id === a.bedId) : null;
+  const room = bed ? db.rooms.find(r => r.id === bed.roomId) : null;
+  const building = room ? db.buildings.find(b => b.id === room.buildingId) : null;
+  return {
+    ...a,
+    employee: emp ? { id: emp.id, name: emp.name, gender: emp.gender, department: emp.department, position: emp.position, phone: emp.phone, createdAt: emp.createdAt } : null,
+    bed: bed ? { ...bed, room: room ? { ...room, buildingName: building?.name } : undefined } : null,
+  };
+}
+
+function buildMatchedBeds(app: any, includePriority: boolean = true) {
+  const forbiddenBuildings = db.forbiddenRules
+    .filter(r => r.department === app.department)
+    .map(r => r.buildingId);
+
+  const matchingBuildings = db.buildings.filter(b =>
+    b.gender === app.gender && !forbiddenBuildings.includes(b.id)
+  );
+
+  const buildingPrefMap = new Map<string, number>();
+  for (const pref of db.buildingPreferences.filter(p => p.department === app.department)) {
+    buildingPrefMap.set(pref.buildingId, pref.priority);
+  }
+
+  const matchingRooms = db.rooms.filter(r =>
+    matchingBuildings.some(b => b.id === r.buildingId) && r.dormitoryType === app.dormitoryType,
+  );
+
+  const matchingBeds = db.beds.filter(b =>
+    matchingRooms.some(r => r.id === b.roomId) && b.status === 'available',
+  );
+
+  const enrichedBeds = matchingBeds.map(bed => {
+    const room = db.rooms.find(r => r.id === bed.roomId)!;
+    const building = db.buildings.find(b => b.id === room.buildingId)!;
+
+    const roomBeds = db.beds.filter(b => b.roomId === room.id);
+    const occupiedBeds = roomBeds.filter(b => b.status === 'occupied' && b.currentOccupantId);
+    const occupantDepartments: string[] = [];
+    for (const ob of occupiedBeds) {
+      const occupantApp = db.applications.find(a => a.employeeId === ob.currentOccupantId && a.status === 'assigned');
+      if (occupantApp) occupantDepartments.push(occupantApp.department);
+    }
+
+    const sameDeptCount = occupantDepartments.filter(d => d === app.department).length;
+    const diffDeptCount = occupantDepartments.filter(d => d !== app.department).length;
+    const buildingPrefScore = buildingPrefMap.get(building.id) || 0;
+
+    let priority: 'high' | 'medium' | 'low' = 'medium';
+    let priorityReason = '';
+    if (sameDeptCount > 0) {
+      priority = 'high';
+      priorityReason = `房间已有${sameDeptCount}位${app.department}同事`;
+    } else if (buildingPrefScore >= 7) {
+      priority = 'high';
+      priorityReason = `${building.name}是${app.department}偏好楼栋`;
+    } else if (diffDeptCount > 0) {
+      priority = 'low';
+      priorityReason = `房间已有${diffDeptCount}位其他部门同事`;
+    } else {
+      priority = 'medium';
+      priorityReason = '空闲房间，无部门偏好';
+    }
+
+    return {
+      ...bed,
+      roomNumber: room.roomNumber,
+      buildingName: building.name,
+      buildingId: building.id,
+      floor: room.floor,
+      dormitoryType: room.dormitoryType,
+      roomOccupants: occupiedBeds.length,
+      roomCapacity: room.capacity,
+      occupantDepartments: [...new Set(occupantDepartments)],
+      sameDeptCount,
+      buildingPrefScore,
+      priority,
+      priorityReason,
+    };
+  });
+
+  if (includePriority) {
+    enrichedBeds.sort((a, b) => {
+      const priorityOrder = { high: 0, medium: 1, low: 2 };
+      if (priorityOrder[a.priority] !== priorityOrder[b.priority]) {
+        return priorityOrder[a.priority] - priorityOrder[b.priority];
+      }
+      if (a.sameDeptCount !== b.sameDeptCount) return b.sameDeptCount - a.sameDeptCount;
+      if (a.buildingPrefScore !== b.buildingPrefScore) return b.buildingPrefScore - a.buildingPrefScore;
+      return a.floor - b.floor;
+    });
+  }
+
+  return enrichedBeds;
+}
+
+function buildAutoAssignReason(bed: any, app: any): string {
+  const reasons: string[] = [];
+
+  const deptPriority = db.departmentPriorities.find(dp => dp.department === app.department);
+  if (deptPriority) {
+    reasons.push(`部门优先级${deptPriority.priority}`);
+  }
+
+  const buildingPref = db.buildingPreferences.find(
+    bp => bp.department === app.department && bp.buildingId === bed.buildingId
+  );
+  if (buildingPref) {
+    reasons.push(`${bed.buildingName}偏好权重${buildingPref.priority}`);
+  }
+
+  if (bed.sameDeptCount > 0) {
+    reasons.push(`同部门比例${bed.sameDeptCount}/${bed.roomCapacity}`);
+  } else {
+    reasons.push(`房型${bed.dormitoryType === 'single' ? '单人间' : bed.dormitoryType === 'double' ? '双人间' : '四人间'}`);
+  }
+
+  reasons.push(`${bed.floor}楼低楼层`);
+
+  return reasons.join(' → ');
+}
+
+function validateBedForApprove(bedId: string, app: any): { ok: boolean; statusCode?: number; error?: string } {
+  const DORM_TYPE_MAP: Record<string, string> = { single: '单人间', double: '双人间', quad: '四人间' };
+  const GENDER_MAP: Record<string, string> = { male: '男', female: '女' };
+
+  const bed = db.beds.find(b => b.id === bedId);
+  if (!bed) return { ok: false, statusCode: 404, error: '所选床位不存在' };
+
+  if (bed.status !== 'available') {
+    return { ok: false, statusCode: 409, error: '床位已被占用，请重新选择' };
+  }
+
+  const room = db.rooms.find(r => r.id === bed.roomId);
+  if (!room) return { ok: false, statusCode: 404, error: '床位所在房间不存在' };
+
+  if (room.dormitoryType !== app.dormitoryType) {
+    return {
+      ok: false,
+      statusCode: 409,
+      error: `房型不匹配：申请${DORM_TYPE_MAP[app.dormitoryType] || app.dormitoryType}，床位属于${DORM_TYPE_MAP[room.dormitoryType] || room.dormitoryType}`,
+    };
+  }
+
+  const building = db.buildings.find(b => b.id === room.buildingId);
+  if (!building) return { ok: false, statusCode: 404, error: '床位所在楼栋不存在' };
+
+  if (building.gender !== app.gender) {
+    return { ok: false, statusCode: 409, error: `性别不匹配：该床位属于${GENDER_MAP[building.gender] || building.gender}生宿舍楼` };
+  }
+
+  const forbidden = db.forbiddenRules.find(
+    r => r.department === app.department && r.buildingId === building.id
+  );
+  if (forbidden) {
+    return { ok: false, statusCode: 409, error: `禁住规则冲突：${forbidden.reason}` };
+  }
+
+  const activeAssignments = db.applications.filter(
+    a => a.employeeId === app.employeeId && a.status === 'assigned' && a.id !== app.id,
+  );
+  const hasActiveAssignment = activeAssignments.some(activeApp => {
+    const hasCompletedCheckout = db.checkouts.some(
+      c => c.applicationId === activeApp.id && c.status === 'completed',
+    );
+    return !hasCompletedCheckout;
+  });
+  if (hasActiveAssignment) {
+    return { ok: false, statusCode: 409, error: '该员工已有生效入住，不能重复分配' };
+  }
+
+  return { ok: true };
+}
+
+router.get('/rules', (_req: Request, res: Response) => {
+  const departments = getDepartments();
+  const buildings = db.buildings.map(b => ({ id: b.id, name: b.name, gender: b.gender }));
+  res.json({
+    departmentPriorities: [...db.departmentPriorities],
+    buildingPreferences: db.buildingPreferences.map(bp => {
+      const b = db.buildings.find(x => x.id === bp.buildingId);
+      return { ...bp, buildingName: b?.name || '' };
+    }),
+    forbiddenRules: db.forbiddenRules.map(fr => {
+      const b = db.buildings.find(x => x.id === fr.buildingId);
+      return { ...fr, buildingName: b?.name || '' };
+    }),
+    departments,
+    buildings,
+  });
+});
+
+router.put('/rules', (req: Request, res: Response) => {
+  const { departmentPriorities, buildingPreferences, forbiddenRules } = req.body;
+
+  if (Array.isArray(departmentPriorities)) {
+    db.departmentPriorities.length = 0;
+    for (const dp of departmentPriorities) {
+      db.departmentPriorities.push({
+        id: dp.id || uuidv4(),
+        department: dp.department,
+        priority: Math.max(1, Math.min(10, Number(dp.priority) || 5)),
+      });
+    }
+  }
+
+  if (Array.isArray(buildingPreferences)) {
+    db.buildingPreferences.length = 0;
+    for (const bp of buildingPreferences) {
+      db.buildingPreferences.push({
+        id: bp.id || uuidv4(),
+        department: bp.department,
+        buildingId: bp.buildingId,
+        priority: Math.max(1, Math.min(10, Number(bp.priority) || 5)),
+      });
+    }
+  }
+
+  if (Array.isArray(forbiddenRules)) {
+    db.forbiddenRules.length = 0;
+    for (const fr of forbiddenRules) {
+      db.forbiddenRules.push({
+        id: fr.id || uuidv4(),
+        department: fr.department,
+        buildingId: fr.buildingId,
+        reason: fr.reason || '',
+      });
+    }
+  }
+
+  res.json({
+    departmentPriorities: [...db.departmentPriorities],
+    buildingPreferences: [...db.buildingPreferences],
+    forbiddenRules: [...db.forbiddenRules],
+  });
+});
+
 router.get('/', (req: Request, res: Response) => {
   const { status, keyword, page = '1', pageSize = '10' } = req.query;
   let list = [...db.applications];
@@ -28,17 +289,7 @@ router.get('/', (req: Request, res: Response) => {
   const start = (p - 1) * ps;
   const items = list.slice(start, start + ps);
 
-  const enrichedList = items.map(a => {
-    const emp = db.employees.find(e => e.id === a.employeeId);
-    const bed = a.bedId ? db.beds.find(b => b.id === a.bedId) : null;
-    const room = bed ? db.rooms.find(r => r.id === bed.roomId) : null;
-    const building = room ? db.buildings.find(b => b.id === room.buildingId) : null;
-    return {
-      ...a,
-      employee: emp ? { id: emp.id, name: emp.name, gender: emp.gender, department: emp.department, position: emp.position, phone: emp.phone, createdAt: emp.createdAt } : null,
-      bed: bed ? { ...bed, room: room ? { ...room, buildingName: building?.name } : undefined } : null,
-    };
-  });
+  const enrichedList = items.map(a => enrichApplication(a));
 
   res.json({ total, list: enrichedList });
 });
@@ -59,6 +310,7 @@ router.post('/', (req: Request, res: Response) => {
     rejectedReason: null,
     startDate: null,
     endDate: null,
+    assignReason: null,
     createdAt: new Date().toISOString(),
   };
   db.applications.push(app);
@@ -72,63 +324,20 @@ router.get('/:id/match-beds', (req: Request, res: Response) => {
     return;
   }
 
-  const matchingBuildings = db.buildings.filter(b => b.gender === app.gender);
-  const matchingRooms = db.rooms.filter(r =>
-    matchingBuildings.some(b => b.id === r.buildingId) && r.dormitoryType === app.dormitoryType,
-  );
-  const matchingBeds = db.beds.filter(b =>
-    matchingRooms.some(r => r.id === b.roomId) && b.status === 'available',
-  );
+  const sorted = buildMatchedBeds(app);
 
-  const enrichedBeds = matchingBeds.map(bed => {
-    const room = db.rooms.find(r => r.id === bed.roomId)!;
-    const building = db.buildings.find(b => b.id === room.buildingId)!;
+  const forbiddenBuildings = db.forbiddenRules
+    .filter(r => r.department === app.department)
+    .map(r => {
+      const b = db.buildings.find(x => x.id === r.buildingId);
+      return { buildingName: b?.name || '', reason: r.reason };
+    });
 
-    const roomBeds = db.beds.filter(b => b.roomId === room.id);
-    const occupiedBeds = roomBeds.filter(b => b.status === 'occupied' && b.currentOccupantId);
-    const occupantDepartments: string[] = [];
-    for (const ob of occupiedBeds) {
-      const occupantApp = db.applications.find(a => a.employeeId === ob.currentOccupantId && a.status === 'assigned');
-      if (occupantApp) occupantDepartments.push(occupantApp.department);
-    }
-
-    const sameDeptCount = occupantDepartments.filter(d => d === app.department).length;
-    const diffDeptCount = occupantDepartments.filter(d => d !== app.department).length;
-
-    let priority: 'high' | 'medium' | 'low' = 'medium';
-    let priorityReason = '';
-    if (sameDeptCount > 0) {
-      priority = 'high';
-      priorityReason = `房间已有${sameDeptCount}位${app.department}同事`;
-    } else if (diffDeptCount > 0) {
-      priority = 'low';
-      priorityReason = `房间已有${diffDeptCount}位其他部门同事`;
-    } else {
-      priority = 'medium';
-      priorityReason = '空闲房间，无部门偏好';
-    }
-
-    return {
-      ...bed,
-      roomNumber: room.roomNumber,
-      buildingName: building.name,
-      buildingId: building.id,
-      floor: room.floor,
-      dormitoryType: room.dormitoryType,
-      roomOccupants: occupiedBeds.length,
-      roomCapacity: room.capacity,
-      occupantDepartments: [...new Set(occupantDepartments)],
-      priority,
-      priorityReason,
-    };
+  res.json({
+    beds: sorted.map(({ sameDeptCount, buildingPrefScore, ...rest }) => rest),
+    department: app.department,
+    forbiddenBuildings,
   });
-
-  const sorted = enrichedBeds.sort((a, b) => {
-    const priorityOrder = { high: 0, medium: 1, low: 2 };
-    return priorityOrder[a.priority] - priorityOrder[b.priority];
-  });
-
-  res.json({ beds: sorted, department: app.department });
 });
 
 router.get('/:id', (req: Request, res: Response) => {
@@ -137,31 +346,64 @@ router.get('/:id', (req: Request, res: Response) => {
     res.status(404).json({ error: 'Application not found' });
     return;
   }
-  const emp = db.employees.find(e => e.id === app.employeeId);
-  const bed = app.bedId ? db.beds.find(b => b.id === app.bedId) : null;
-  const room = bed ? db.rooms.find(r => r.id === bed.roomId) : null;
-  const building = room ? db.buildings.find(b => b.id === room.buildingId) : null;
-  res.json({
-    ...app,
-    employee: emp || null,
-    bed: bed ? { ...bed, room: room ? { ...room, buildingName: building?.name } : undefined } : null,
-  });
+  res.json(enrichApplication(app));
 });
 
-router.put('/:id/approve', (req: Request, res: Response) => {
+router.put('/:id/auto-assign', (req: Request, res: Response) => {
   const app = db.applications.find(a => a.id === req.params.id);
   if (!app) {
     res.status(404).json({ error: 'Application not found' });
     return;
   }
 
-  const { bedId } = req.body;
-  const bed = db.beds.find(b => b.id === bedId);
-  if (!bed) {
-    res.status(400).json({ error: 'Bed not found' });
+  if (app.status !== 'pending') {
+    res.status(400).json({ error: '仅待审批状态可自动分配' });
     return;
   }
 
+  const enrichedBeds = buildMatchedBeds(app);
+
+  if (enrichedBeds.length === 0) {
+    res.status(404).json({ error: '未找到可用床位', reason: '无符合条件的空余床位，请检查禁住规则或楼栋容量' });
+    return;
+  }
+
+  const bestBed = enrichedBeds[0];
+  const assignReason = buildAutoAssignReason(bestBed, app);
+
+  const resultBed = {
+    id: bestBed.id,
+    bedNumber: bestBed.bedNumber,
+    roomNumber: bestBed.roomNumber,
+    buildingName: bestBed.buildingName,
+    buildingId: bestBed.buildingId,
+    floor: bestBed.floor,
+    dormitoryType: bestBed.dormitoryType,
+  };
+
+  res.json({
+    bed: resultBed,
+    assignReason,
+    matchedBedsCount: enrichedBeds.length,
+  });
+});
+
+router.put('/:id/approve', (req: Request, res: Response) => {
+  const app = db.applications.find(a => a.id === req.params.id);
+  if (!app) {
+    res.status(404).json({ error: '申请不存在' });
+    return;
+  }
+
+  const { bedId, assignReason: customReason } = req.body;
+
+  const validation = validateBedForApprove(bedId, app);
+  if (!validation.ok) {
+    res.status(validation.statusCode || 409).json({ error: validation.error || '校验失败' });
+    return;
+  }
+
+  const bed = db.beds.find(b => b.id === bedId)!;
   bed.status = 'occupied';
   bed.currentOccupantId = app.employeeId;
 
@@ -169,11 +411,21 @@ router.put('/:id/approve', (req: Request, res: Response) => {
   const end = new Date(now);
   end.setMonth(end.getMonth() + 6);
 
+  let finalReason = customReason;
+  if (!finalReason) {
+    const enrichedList = buildMatchedBeds(app, false);
+    const matched = enrichedList.find(b => b.id === bedId);
+    if (matched) {
+      finalReason = buildAutoAssignReason(matched, app);
+    }
+  }
+
   app.status = 'assigned';
   app.bedId = bedId;
   app.startDate = now.toISOString();
   app.endDate = end.toISOString();
   app.assignedAt = now.toISOString();
+  app.assignReason = finalReason;
 
   const emp = db.employees.find(e => e.id === app.employeeId);
   const room = db.rooms.find(r => r.id === bed.roomId);
@@ -184,11 +436,11 @@ router.put('/:id/approve', (req: Request, res: Response) => {
     employeeName: emp?.name || '',
     operationType: 'checkin',
     roomNumber: room?.roomNumber || '',
-    description: `${emp?.name || ''}入住${room?.roomNumber || ''}-${bed.bedNumber}`,
+    description: `${emp?.name || ''}入住${room?.roomNumber || ''}-${bed.bedNumber}${finalReason ? `（${finalReason}）` : ''}`,
     createdAt: now.toISOString(),
   });
 
-  res.json(app);
+  res.json(enrichApplication(app));
 });
 
 router.put('/:id/reject', (req: Request, res: Response) => {
@@ -214,7 +466,7 @@ router.put('/:id/reject', (req: Request, res: Response) => {
     createdAt: new Date().toISOString(),
   });
 
-  res.json(app);
+  res.json(enrichApplication(app));
 });
 
 export default router;

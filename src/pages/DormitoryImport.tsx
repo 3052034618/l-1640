@@ -1,83 +1,133 @@
-import { useState, useRef } from 'react'
+import { useState, useRef, useEffect } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { ArrowLeft, Upload, FileSpreadsheet, CheckCircle, AlertCircle, Download } from 'lucide-react'
+import {
+  ArrowLeft, Upload, FileSpreadsheet, CheckCircle, AlertCircle, Download, History, FileDown, RotateCcw, Building, BedDouble, Users
+} from 'lucide-react'
 import * as XLSX from 'xlsx'
+import type { PreviewResult, ImportHistory, ConfirmResult, ImportError, PreviewBuildItem, PreviewRoomItem } from '@/types'
 
-interface ImportResult {
-  success: number
-  failed: number
-  errors: { row: number; message: string }[]
-}
+const TEMPLATE_COLUMNS = ['楼栋名称', '性别', '楼层数', '楼层号', '房间号', '房型']
+const TABS = [
+  { key: 'import', label: '导入', icon: Upload },
+  { key: 'history', label: '历史', icon: History },
+  { key: 'template', label: '下载模板', icon: FileDown },
+] as const
 
-interface RowWithMeta {
-  _rowIndex: number
-  _error: string | null
-  [key: string]: unknown
-}
+type TabKey = typeof TABS[number]['key']
 
 export default function DormitoryImport() {
   const navigate = useNavigate()
   const fileRef = useRef<HTMLInputElement>(null)
-  const [parsedData, setParsedData] = useState<RowWithMeta[]>([])
-  const [columns, setColumns] = useState<string[]>([])
+  const [activeTab, setActiveTab] = useState<TabKey>('import')
   const [fileName, setFileName] = useState('')
-  const [importing, setImporting] = useState(false)
-  const [result, setResult] = useState<ImportResult | null>(null)
   const [dragOver, setDragOver] = useState(false)
+  const [previewing, setPreviewing] = useState(false)
+  const [confirming, setConfirming] = useState(false)
+  const [preview, setPreview] = useState<PreviewResult | null>(null)
+  const [rawData, setRawData] = useState<Record<string, unknown>[]>([])
+  const [confirmResult, setConfirmResult] = useState<ConfirmResult | null>(null)
+  const [histories, setHistories] = useState<ImportHistory[]>([])
+  const [loadingHistory, setLoadingHistory] = useState(false)
+  const [rollbackId, setRollbackId] = useState<string | null>(null)
 
-  const TEMPLATE_COLUMNS = ['楼栋名称', '性别', '楼层数', '楼层号', '房间号', '房型']
+  const fetchHistory = async () => {
+    setLoadingHistory(true)
+    try {
+      const res = await fetch('/api/buildings/import-history')
+      if (res.ok) {
+        const data = await res.json()
+        setHistories(Array.isArray(data) ? data : [])
+      }
+    } catch {
+    } finally {
+      setLoadingHistory(false)
+    }
+  }
+
+  useEffect(() => {
+    if (activeTab === 'history') {
+      fetchHistory()
+    }
+  }, [activeTab])
 
   const parseFile = (file: File) => {
     setFileName(file.name)
-    setResult(null)
-    setParsedData([])
+    setPreview(null)
+    setConfirmResult(null)
     const reader = new FileReader()
     reader.onload = (e) => {
       const wb = XLSX.read(e.target?.result, { type: 'array' })
       const ws = wb.Sheets[wb.SheetNames[0]]
-      const rawData = XLSX.utils.sheet_to_json<Record<string, unknown>>(ws)
-      if (rawData.length > 0) {
-        const cols = Object.keys(rawData[0])
-        setColumns(cols)
-        const withMeta: RowWithMeta[] = rawData.map((row, i) => ({
-          ...row,
-          _rowIndex: i + 2,
-          _error: null,
-        }))
-        setParsedData(withMeta)
-        doImport(rawData, withMeta, cols)
+      const raw = XLSX.utils.sheet_to_json<Record<string, unknown>>(ws)
+      setRawData(raw)
+      if (raw.length > 0) {
+        doPreview(raw, file.name)
       }
     }
     reader.readAsArrayBuffer(file)
   }
 
-  const doImport = async (rawData: Record<string, unknown>[], currentData: RowWithMeta[], cols: string[]) => {
-    setImporting(true)
+  const doPreview = async (data: Record<string, unknown>[], fn: string) => {
+    setPreviewing(true)
     try {
-      const res = await fetch('/api/buildings/import', {
+      const res = await fetch('/api/buildings/preview', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ data: rawData }),
+        body: JSON.stringify({ data, filename: fn }),
       })
       if (!res.ok) throw new Error()
-      const data: ImportResult = await res.json()
-      setResult(data)
-
-      if (data.errors.length > 0) {
-        const errorMap = new Map<number, string>()
-        for (const err of data.errors) {
-          errorMap.set(err.row, err.message)
-        }
-        setParsedData(currentData.map(row => ({
-          ...row,
-          _error: errorMap.get(row._rowIndex) || null,
-        })))
-      }
+      const result: PreviewResult = await res.json()
+      setPreview(result)
     } catch {
-      alert('导入请求失败')
+      alert('预览请求失败')
+    } finally {
+      setPreviewing(false)
     }
-    finally {
-      setImporting(false)
+  }
+
+  const handleConfirm = async () => {
+    if (!preview) return
+    setConfirming(true)
+    try {
+      const res = await fetch('/api/buildings/confirm', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ previewId: preview.previewId }),
+      })
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({ error: '确认失败' }))
+        alert(err.error || '确认失败')
+        return
+      }
+      const result: ConfirmResult = await res.json()
+      setConfirmResult(result)
+      setPreview(null)
+      setRawData([])
+      setFileName('')
+    } catch {
+      alert('确认请求失败')
+    } finally {
+      setConfirming(false)
+    }
+  }
+
+  const handleRollback = async (id: string) => {
+    if (!confirm('确认要撤回该次导入吗？此操作不可恢复。')) return
+    setRollbackId(id)
+    try {
+      const res = await fetch(`/api/buildings/import-history/${id}/rollback`, {
+        method: 'POST',
+      })
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({ error: '撤回失败' }))
+        alert(err.error || '撤回失败')
+        return
+      }
+      await fetchHistory()
+    } catch {
+      alert('撤回请求失败')
+    } finally {
+      setRollbackId(null)
     }
   }
 
@@ -101,7 +151,17 @@ export default function DormitoryImport() {
     XLSX.writeFile(wb, '宿舍导入模板.xlsx')
   }
 
-  const errorRowSet = new Set(result?.errors.map(e => e.row) || [])
+  const formatTime = (iso: string) => {
+    const d = new Date(iso)
+    return d.toLocaleString('zh-CN', { hour12: false })
+  }
+
+  const formatType = (t: string) => {
+    const map: Record<string, string> = { single: '单人间', double: '双人间', quad: '四人间', 单人间: '单人间', 双人间: '双人间', 四人间: '四人间' }
+    return map[t] || t
+  }
+
+  const genderLabel = (g: string) => g === 'male' || g === '男' ? '男' : '女'
 
   return (
     <div className="p-6 space-y-4">
@@ -111,89 +171,302 @@ export default function DormitoryImport() {
 
       <div className="flex items-center justify-between">
         <h1 className="text-xl font-bold text-gray-900">批量导入</h1>
-        <button className="btn-outline flex items-center gap-2 text-sm" onClick={handleDownloadTemplate}>
-          <Download className="w-4 h-4" /> 下载模板
-        </button>
       </div>
 
-      <div className={`card p-8 border-2 border-dashed transition-colors ${dragOver ? 'border-[#1E3A5F] bg-blue-50' : 'border-gray-300'} ${importing ? 'opacity-60 pointer-events-none' : ''}`}
-        onDragOver={e => { e.preventDefault(); setDragOver(true) }}
-        onDragLeave={() => setDragOver(false)}
-        onDrop={handleDrop}
-        onClick={() => fileRef.current?.click()}>
-        <div className="text-center">
-          <Upload className="w-10 h-10 mx-auto text-gray-400 mb-3" />
-          <p className="text-sm text-gray-600">拖拽文件到此处，或 <span className="text-[#1E3A5F] font-medium cursor-pointer">点击上传</span></p>
-          <p className="text-xs text-gray-400 mt-1">支持 .xlsx / .csv 格式，选完文件自动校验并导入</p>
-          {fileName && <p className="text-xs text-emerald-600 mt-2 flex items-center justify-center gap-1"><FileSpreadsheet className="w-3 h-3" /> {fileName}</p>}
-          {importing && <p className="text-sm text-[#1E3A5F] mt-2 animate-pulse">正在校验并导入...</p>}
-        </div>
-        <input ref={fileRef} type="file" accept=".xlsx,.xls,.csv" className="hidden" onChange={e => { if (e.target.files?.[0]) parseFile(e.target.files[0]) }} />
+      <div className="card p-1 inline-flex gap-1 bg-gray-100 rounded-lg w-fit">
+        {TABS.map(tab => (
+          <button
+            key={tab.key}
+            onClick={() => setActiveTab(tab.key)}
+            className={`flex items-center gap-2 px-4 py-2 rounded-md text-sm font-medium transition-colors ${
+              activeTab === tab.key
+                ? 'bg-white text-[#1E3A5F] shadow-sm'
+                : 'text-gray-600 hover:text-gray-900'
+            }`}
+          >
+            <tab.icon className="w-4 h-4" /> {tab.label}
+          </button>
+        ))}
       </div>
 
-      {result && (
-        <div className="card p-4">
-          <div className="flex items-center gap-6 mb-2">
-            <div className="flex items-center gap-2">
-              <CheckCircle className="w-5 h-5 text-emerald-500" />
-              <span className="text-sm">成功导入: <strong className="text-emerald-600">{result.success}</strong> 间</span>
+      {activeTab === 'import' && (
+        <div className="space-y-4">
+          <div
+            className={`card p-8 border-2 border-dashed transition-colors ${dragOver ? 'border-[#1E3A5F] bg-blue-50' : 'border-gray-300'} ${previewing ? 'opacity-60 pointer-events-none' : ''}`}
+            onDragOver={e => { e.preventDefault(); setDragOver(true) }}
+            onDragLeave={() => setDragOver(false)}
+            onDrop={handleDrop}
+            onClick={() => fileRef.current?.click()}
+          >
+            <div className="text-center">
+              <Upload className="w-10 h-10 mx-auto text-gray-400 mb-3" />
+              <p className="text-sm text-gray-600">拖拽文件到此处，或 <span className="text-[#1E3A5F] font-medium cursor-pointer">点击上传</span></p>
+              <p className="text-xs text-gray-400 mt-1">支持 .xlsx / .csv 格式</p>
+              {fileName && <p className="text-xs text-emerald-600 mt-2 flex items-center justify-center gap-1"><FileSpreadsheet className="w-3 h-3" /> {fileName}</p>}
+              {previewing && <p className="text-sm text-[#1E3A5F] mt-2 animate-pulse">正在校验数据...</p>}
             </div>
-            {result.failed > 0 && (
-              <div className="flex items-center gap-2">
-                <AlertCircle className="w-5 h-5 text-red-500" />
-                <span className="text-sm">校验失败: <strong className="text-red-600">{result.failed}</strong> 行</span>
-              </div>
-            )}
+            <input ref={fileRef} type="file" accept=".xlsx,.xls,.csv" className="hidden" onChange={e => { if (e.target.files?.[0]) parseFile(e.target.files[0]) }} />
           </div>
-          <p className="text-xs text-gray-400">出错行已在下方表格中红色高亮标注，修正后可重新上传</p>
+
+          {confirmResult && (
+            <div className="card p-4">
+              <div className="flex items-center gap-6 mb-2">
+                <div className="flex items-center gap-2">
+                  <CheckCircle className="w-5 h-5 text-emerald-500" />
+                  <span className="text-sm">成功导入: <strong className="text-emerald-600">{confirmResult.successCount}</strong> 间</span>
+                </div>
+                {confirmResult.failedCount > 0 && (
+                  <div className="flex items-center gap-2">
+                    <AlertCircle className="w-5 h-5 text-red-500" />
+                    <span className="text-sm">校验失败: <strong className="text-red-600">{confirmResult.failedCount}</strong> 行</span>
+                  </div>
+                )}
+              </div>
+              <p className="text-xs text-gray-400">导入完成，可在"历史"标签页查看记录</p>
+            </div>
+          )}
+
+          {preview && (
+            <div className="space-y-4">
+              <div className="card p-4">
+                <div className="flex items-center justify-between mb-3">
+                  <h3 className="font-bold text-gray-900">预览结果</h3>
+                  <button
+                    className="btn-primary flex items-center gap-2 text-sm disabled:opacity-50"
+                    onClick={handleConfirm}
+                    disabled={confirming || preview.rooms.length === 0}
+                  >
+                    <CheckCircle className="w-4 h-4" />
+                    {confirming ? '确认导入中...' : `确认导入 (${preview.rooms.length} 间)`}
+                  </button>
+                </div>
+                <div className="grid grid-cols-3 gap-4">
+                  <div className="p-3 bg-blue-50 rounded-lg">
+                    <div className="flex items-center gap-2 text-sm text-gray-600 mb-1">
+                      <Building className="w-4 h-4" /> 新增楼栋
+                    </div>
+                    <div className="text-2xl font-bold text-[#1E3A5F]">{preview.buildings.length}</div>
+                  </div>
+                  <div className="p-3 bg-emerald-50 rounded-lg">
+                    <div className="flex items-center gap-2 text-sm text-gray-600 mb-1">
+                      <BedDouble className="w-4 h-4" /> 新增房间
+                    </div>
+                    <div className="text-2xl font-bold text-emerald-600">{preview.rooms.length}</div>
+                  </div>
+                  <div className="p-3 bg-orange-50 rounded-lg">
+                    <div className="flex items-center gap-2 text-sm text-gray-600 mb-1">
+                      <Users className="w-4 h-4" /> 新增床位
+                    </div>
+                    <div className="text-2xl font-bold text-orange-600">
+                      {preview.rooms.reduce((sum, r) => sum + r.capacity, 0)}
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              {preview.buildings.length > 0 && (
+                <div className="card overflow-hidden">
+                  <div className="p-4 border-b border-gray-100">
+                    <h3 className="font-bold text-gray-900">新增楼栋列表</h3>
+                  </div>
+                  <div className="overflow-x-auto max-h-60 overflow-y-auto">
+                    <table className="w-full text-sm">
+                      <thead className="sticky top-0 bg-gray-50 z-10">
+                        <tr className="table-header">
+                          <th className="px-3 py-2 text-left">楼栋名称</th>
+                          <th className="px-3 py-2 text-left">性别</th>
+                          <th className="px-3 py-2 text-left">楼层数</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {preview.buildings.map((b: PreviewBuildItem, i: number) => (
+                          <tr key={i} className="border-b border-gray-50 hover:bg-gray-50">
+                            <td className="px-3 py-2 text-gray-700">{b.name}</td>
+                            <td className="px-3 py-2 text-gray-700">{genderLabel(b.gender)}</td>
+                            <td className="px-3 py-2 text-gray-700">{b.floors}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+              )}
+
+              {preview.rooms.length > 0 && (
+                <div className="card overflow-hidden">
+                  <div className="p-4 border-b border-gray-100">
+                    <h3 className="font-bold text-gray-900">新增房间列表</h3>
+                  </div>
+                  <div className="overflow-x-auto max-h-72 overflow-y-auto">
+                    <table className="w-full text-sm">
+                      <thead className="sticky top-0 bg-gray-50 z-10">
+                        <tr className="table-header">
+                          <th className="px-3 py-2 text-left">所属楼栋</th>
+                          <th className="px-3 py-2 text-left">楼层</th>
+                          <th className="px-3 py-2 text-left">房号</th>
+                          <th className="px-3 py-2 text-left">房型</th>
+                          <th className="px-3 py-2 text-left">床位数</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {preview.rooms.map((r: PreviewRoomItem, i: number) => (
+                          <tr key={i} className="border-b border-gray-50 hover:bg-gray-50">
+                            <td className="px-3 py-2 text-gray-700">{r.buildingName}</td>
+                            <td className="px-3 py-2 text-gray-700">{r.floor}</td>
+                            <td className="px-3 py-2 text-gray-700">{r.roomNumber}</td>
+                            <td className="px-3 py-2 text-gray-700">{formatType(r.dormitoryType)}</td>
+                            <td className="px-3 py-2 text-gray-700">{r.capacity}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+              )}
+
+              {preview.errors.length > 0 && (
+                <div className="card overflow-hidden">
+                  <div className="p-4 border-b border-gray-100">
+                    <h3 className="font-bold text-red-600 flex items-center gap-2">
+                      <AlertCircle className="w-4 h-4" />
+                      错误明细 ({preview.errors.length} 条)
+                    </h3>
+                  </div>
+                  <div className="overflow-x-auto max-h-60 overflow-y-auto">
+                    <table className="w-full text-sm">
+                      <thead className="sticky top-0 bg-gray-50 z-10">
+                        <tr className="table-header">
+                          <th className="px-3 py-2 w-16">行号</th>
+                          <th className="px-3 py-2 text-left">错误原因</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {preview.errors.map((e: ImportError, i: number) => (
+                          <tr key={i} className="border-b border-gray-50 bg-red-50">
+                            <td className="px-3 py-2 text-center text-red-600 font-bold">{e.row}</td>
+                            <td className="px-3 py-2 text-red-700">{e.message}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
         </div>
       )}
 
-      {parsedData.length > 0 && (
+      {activeTab === 'history' && (
         <div className="card overflow-hidden">
-          <div className="p-4 flex items-center justify-between border-b border-gray-100">
-            <h3 className="font-bold text-gray-900">
-              {result ? '导入结果明细' : '数据预览'} ({parsedData.length} 条)
-            </h3>
-          </div>
-          <div className="overflow-x-auto max-h-96 overflow-y-auto">
-            <table className="w-full text-sm">
-              <thead className="sticky top-0 bg-gray-50 z-10">
-                <tr className="table-header">
-                  <th className="px-3 py-2 w-12">行号</th>
-                  {columns.map(col => <th key={col} className="px-3 py-2">{col}</th>)}
-                  {result && result.failed > 0 && <th className="px-3 py-2">校验结果</th>}
-                </tr>
-              </thead>
-              <tbody>
-                {parsedData.map((row) => {
-                  const hasError = row._error !== null
-                  return (
-                    <tr key={row._rowIndex} className={`border-b border-gray-50 ${hasError ? 'bg-red-50' : errorRowSet.has(row._rowIndex) ? 'bg-red-50' : 'hover:bg-gray-50'}`}>
-                      <td className={`px-3 py-2 text-center text-xs ${hasError ? 'text-red-600 font-bold' : 'text-gray-400'}`}>{row._rowIndex}</td>
-                      {columns.map(col => (
-                        <td key={col} className={`px-3 py-2 ${hasError ? 'text-red-700' : 'text-gray-700'}`}>
-                          {String(row[col] ?? '')}
-                        </td>
-                      ))}
-                      {result && result.failed > 0 && (
-                        <td className="px-3 py-2">
-                          {hasError ? (
-                            <span className="text-xs text-red-600 flex items-center gap-1">
-                              <AlertCircle className="w-3 h-3 flex-shrink-0" /> {row._error}
-                            </span>
-                          ) : (
-                            <span className="text-xs text-emerald-600 flex items-center gap-1">
-                              <CheckCircle className="w-3 h-3" /> 通过
-                            </span>
-                          )}
-                        </td>
-                      )}
+          {loadingHistory ? (
+            <div className="p-12 text-center text-gray-400">加载中...</div>
+          ) : histories.length === 0 ? (
+            <div className="p-12 text-center text-gray-400">暂无导入记录</div>
+          ) : (
+            <div className="overflow-x-auto">
+              <table className="w-full text-sm">
+                <thead className="bg-gray-50">
+                  <tr className="table-header">
+                    <th className="px-4 py-3 text-left">导入时间</th>
+                    <th className="px-4 py-3 text-left">文件名</th>
+                    <th className="px-4 py-3 text-left">操作人</th>
+                    <th className="px-4 py-3 text-center">成功</th>
+                    <th className="px-4 py-3 text-center">失败</th>
+                    <th className="px-4 py-3 text-left">状态</th>
+                    <th className="px-4 py-3 text-center">操作</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {histories.map(h => (
+                    <tr key={h.id} className="border-b border-gray-50 hover:bg-gray-50">
+                      <td className="px-4 py-3 text-gray-700">{formatTime(h.createdAt)}</td>
+                      <td className="px-4 py-3 text-gray-700 flex items-center gap-2">
+                        <FileSpreadsheet className="w-4 h-4 text-gray-400" /> {h.filename}
+                      </td>
+                      <td className="px-4 py-3 text-gray-700">{h.operator}</td>
+                      <td className="px-4 py-3 text-center">
+                        <span className="text-emerald-600 font-medium">{h.successCount}</span>
+                      </td>
+                      <td className="px-4 py-3 text-center">
+                        <span className={h.failedCount > 0 ? 'text-red-600 font-medium' : 'text-gray-400'}>
+                          {h.failedCount}
+                        </span>
+                      </td>
+                      <td className="px-4 py-3">
+                        <span className={`inline-block px-2 py-0.5 rounded-full text-xs font-medium ${
+                          h.status === 'confirmed'
+                            ? 'bg-blue-100 text-blue-800'
+                            : 'bg-gray-100 text-gray-600'
+                        }`}>
+                          {h.status === 'confirmed' ? '已确认' : '已撤回'}
+                        </span>
+                      </td>
+                      <td className="px-4 py-3 text-center">
+                        <button
+                          className={`inline-flex items-center gap-1 text-xs px-3 py-1 rounded-md transition-colors ${
+                            h.status === 'confirmed'
+                              ? 'text-orange-600 hover:bg-orange-50 hover:text-orange-700 disabled:opacity-50'
+                              : 'text-gray-400 cursor-not-allowed'
+                          }`}
+                          onClick={() => h.status === 'confirmed' && handleRollback(h.id)}
+                          disabled={h.status !== 'confirmed' || rollbackId === h.id}
+                        >
+                          <RotateCcw className="w-3 h-3" />
+                          {rollbackId === h.id ? '撤回中...' : '撤回'}
+                        </button>
+                      </td>
                     </tr>
-                  )
-                })}
-              </tbody>
-            </table>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </div>
+      )}
+
+      {activeTab === 'template' && (
+        <div className="card p-6">
+          <div className="flex items-start gap-4 mb-6">
+            <div className="w-16 h-16 rounded-xl bg-[#1E3A5F] bg-opacity-10 flex items-center justify-center flex-shrink-0">
+              <FileSpreadsheet className="w-8 h-8 text-[#1E3A5F]" />
+            </div>
+            <div className="flex-1">
+              <h3 className="font-bold text-gray-900 mb-1">导入模板说明</h3>
+              <p className="text-sm text-gray-500 mb-3">
+                请按照模板格式填写数据，支持 .xlsx 和 .csv 格式的Excel文件。
+              </p>
+              <button
+                className="btn-primary inline-flex items-center gap-2 text-sm"
+                onClick={handleDownloadTemplate}
+              >
+                <Download className="w-4 h-4" /> 下载模板
+              </button>
+            </div>
+          </div>
+
+          <div className="border-t border-gray-100 pt-6">
+            <h4 className="font-bold text-gray-900 mb-4">字段说明</h4>
+            <div className="space-y-3">
+              {[
+                { name: '楼栋名称', desc: '楼栋的名称，如"男生宿舍3号楼"', required: true },
+                { name: '性别', desc: '性别，男/女，男/male 或 女/female', required: true },
+                { name: '楼层数', desc: '楼栋总楼层数', required: false },
+                { name: '楼层号', desc: '房间所在楼层号，从1开始', required: true },
+                { name: '房间号', desc: '房间编号，如"101"', required: true },
+                { name: '房型', desc: '单人间/双人间/四人间', required: true },
+              ].map(item => (
+                <div key={item.name} className="flex items-start gap-3 p-3 bg-gray-50 rounded-lg">
+                  <div className="font-medium text-gray-900 w-24 flex-shrink-0">{item.name}</div>
+                  <div className="text-sm text-gray-600 flex-1">{item.desc}</div>
+                  <div className={`text-xs px-2 py-0.5 rounded-full flex-shrink-0 ${
+                    item.required ? 'bg-red-100 text-red-700' : 'bg-gray-200 text-gray-600'
+                  }`}>
+                    {item.required ? '必填' : '可选'}
+                  </div>
+                </div>
+              ))}
+            </div>
           </div>
         </div>
       )}

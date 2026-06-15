@@ -1,5 +1,5 @@
-import { useEffect, useState, useCallback } from 'react'
-import { Search, FileDown } from 'lucide-react'
+import { useEffect, useState, useCallback, useMemo } from 'react'
+import { Search, FileDown, ChevronDown, Filter } from 'lucide-react'
 import type { OperationLog, PaginatedResult } from '@/types'
 import { downloadFile } from '@/lib/helpers'
 
@@ -24,6 +24,7 @@ export default function LogList() {
   const [operationType, setOperationType] = useState('')
   const [loading, setLoading] = useState(true)
   const [exporting, setExporting] = useState(false)
+  const [exportMenuOpen, setExportMenuOpen] = useState(false)
   const pageSize = 10
 
   const fetchData = useCallback(async () => {
@@ -46,16 +47,41 @@ export default function LogList() {
 
   useEffect(() => { fetchData() }, [fetchData])
 
-  const handleExport = async () => {
+  const filterDisplayText = useMemo(() => {
+    const parts: string[] = []
+    if (employeeName) parts.push(`操作人="${employeeName}"`)
+    if (roomNumber) parts.push(`房间="${roomNumber}"`)
+    if (operationType) {
+      const label = TYPE_OPTIONS.find(o => o.value === operationType)?.label || operationType
+      parts.push(`类型="${label}"`)
+    }
+    if (startDate) parts.push(`开始=${startDate}`)
+    if (endDate) parts.push(`结束=${endDate}`)
+    return parts.length > 0 ? parts.join('，') : '无'
+  }, [employeeName, roomNumber, operationType, startDate, endDate])
+
+  const buildExportUrl = (scope: 'current' | 'all') => {
+    const filtersObj: Record<string, string> = {}
+    if (employeeName) filtersObj.employeeName = employeeName
+    if (roomNumber) filtersObj.roomNumber = roomNumber
+    if (operationType) filtersObj.operationType = operationType
+    if (startDate) filtersObj.startDate = startDate
+    if (endDate) filtersObj.endDate = endDate
+
+    const params = new URLSearchParams()
+    params.set('scope', scope)
+    params.set('page', String(page))
+    params.set('pageSize', String(pageSize))
+    params.set('filters', encodeURIComponent(JSON.stringify(filtersObj)))
+
+    return `/api/logs/export?${params}`
+  }
+
+  const handleExport = async (scope: 'current' | 'all') => {
+    setExportMenuOpen(false)
     setExporting(true)
     try {
-      const params = new URLSearchParams()
-      if (employeeName) params.set('employeeName', employeeName)
-      if (roomNumber) params.set('roomNumber', roomNumber)
-      if (startDate) params.set('startDate', startDate)
-      if (endDate) params.set('endDate', endDate)
-      if (operationType) params.set('operationType', operationType)
-      await downloadFile(`/api/logs/export?${params}`, 'operation-logs.xlsx')
+      await downloadFile(buildExportUrl(scope), `operation-logs-${scope === 'current' ? 'page' : 'all'}.xlsx`)
     } catch { alert('导出失败') }
     finally { setExporting(false) }
   }
@@ -76,9 +102,33 @@ export default function LogList() {
     <div className="p-6 space-y-4">
       <div className="flex items-center justify-between">
         <h1 className="text-xl font-bold text-gray-900">操作日志</h1>
-        <button className="btn-outline flex items-center gap-2 text-sm" disabled={exporting} onClick={handleExport}>
-          <FileDown className="w-4 h-4" /> {exporting ? '导出中...' : '导出Excel'}
-        </button>
+        <div className="relative">
+          <button
+            className="btn-outline flex items-center gap-2 text-sm"
+            disabled={exporting}
+            onClick={() => setExportMenuOpen(o => !o)}
+          >
+            <FileDown className="w-4 h-4" />
+            {exporting ? '导出中...' : '导出Excel'}
+            <ChevronDown className="w-4 h-4" />
+          </button>
+          {exportMenuOpen && (
+            <div className="absolute right-0 top-full mt-1 w-44 bg-white border border-gray-200 rounded-lg shadow-lg z-10 overflow-hidden">
+              <button
+                className="w-full text-left px-4 py-2 text-sm text-gray-700 hover:bg-blue-50 hover:text-blue-600"
+                onClick={() => handleExport('current')}
+              >
+                导出当前页
+              </button>
+              <button
+                className="w-full text-left px-4 py-2 text-sm text-gray-700 hover:bg-blue-50 hover:text-blue-600"
+                onClick={() => handleExport('all')}
+              >
+                导出全部结果
+              </button>
+            </div>
+          )}
+        </div>
       </div>
 
       <div className="card p-4 flex items-center gap-4 flex-wrap">
@@ -93,6 +143,15 @@ export default function LogList() {
         <select className="select-field w-28" value={operationType} onChange={e => { setOperationType(e.target.value); setPage(1) }}>
           {TYPE_OPTIONS.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
         </select>
+      </div>
+
+      <div className="card p-3 bg-blue-50 border-blue-100 flex items-start gap-2 text-sm">
+        <Filter className="w-4 h-4 text-blue-600 mt-0.5 flex-shrink-0" />
+        <div>
+          <span className="text-blue-800 font-medium">当前筛选：</span>
+          <span className="text-blue-700">{filterDisplayText}</span>
+          <span className="text-blue-500 ml-2">（共 {total} 条记录）</span>
+        </div>
       </div>
 
       <div className="card overflow-hidden">
